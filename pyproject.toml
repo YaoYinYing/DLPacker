@@ -29,7 +29,7 @@ tensorflow = ">=2.5.0"
 
 numpy = "^1.19.2"
 
-gdown = "4.7.1"
+pooch = "1.8.0"
 
 py7zr = "0.20.8"
 

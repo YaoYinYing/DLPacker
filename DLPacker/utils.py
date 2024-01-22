@@ -53,7 +53,7 @@ import platform
 is_arm_mac=(platform.system() == 'Darwin' and platform.machine()=='arm64')
 
 
-def fetch_and_unzip_google_drive_link(gdrive_link, output_dir):
+def fetch_and_unzip_weight(output_dir):
     """
     Fetches a shared file from a Google Drive link and extracts it from 7-zip format.
 
@@ -67,20 +67,20 @@ def fetch_and_unzip_google_drive_link(gdrive_link, output_dir):
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
-    output_file = tempfile.mktemp(suffix=".7z")
+    import pooch
+    import py7zr
 
-    gdown.download(
-        url=gdrive_link, output=output_file, quiet=False, fuzzy=True
-    )
-
+    WEIGHT_URL='https://github.com/YaoYinYing/DLPacker/releases/download/v1.0-alpha/DLPacker_weights.7z'
+    WEIGHT_MD5='md5:0a05db1e8a0468b570402efbd891102b'
 
     # Extract the downloaded file
     extracted_files = []
     try:
-        
-        import py7zr
+        f=pooch.retrieve(url=WEIGHT_URL, 
+                         known_hash=WEIGHT_MD5,
+                         progressbar=True)
 
-        with py7zr.SevenZipFile(output_file, mode='r') as z:
+        with py7zr.SevenZipFile(f, mode='r') as z:
             z.extractall(path=output_dir)
             extracted_files = os.listdir(output_dir)
             print(f'Extracted files: {extracted_files}')
@@ -89,8 +89,8 @@ def fetch_and_unzip_google_drive_link(gdrive_link, output_dir):
         traceback.print_exc()
 
     finally:
-        os.remove(output_file)
-        pass
+        if f and os.path.exists(f):
+            os.remove(f)
 
     return extracted_files
 

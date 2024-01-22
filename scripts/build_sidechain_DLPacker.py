@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 from pathlib import Path
-from DLPacker.dlpacker import DLPacker
+from DLPacker import DLPacker
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 
 parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
