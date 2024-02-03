@@ -45,9 +45,7 @@ import tensorflow.keras as K
 
 from collections import defaultdict
 
-import gdown
 import os
-import tempfile
 import traceback
 import platform
 is_arm_mac=(platform.system() == 'Darwin' and platform.machine()=='arm64')
