@@ -45,7 +45,7 @@ DEFAULT_CHARGES_RTP = os.path.join(dir_path, 'data', 'charges.rtp')
 CUSTOMIZED_WEIGHTS_DIR=os.getenv('DLPACKER_PRETRAINED_WEIGHT')
 if CUSTOMIZED_WEIGHTS_DIR:
     if not os.path.exists(CUSTOMIZED_WEIGHTS_DIR):
-        os.makedirs(CUSTOMIZED_WEIGHTS_DIR)
+        os.makedirs(CUSTOMIZED_WEIGHTS_DIR,exist_ok=True)
     DEFAULT_WEIGHTS = os.path.join(CUSTOMIZED_WEIGHTS_DIR, 'DLPacker_weights')
 else:
     DEFAULT_WEIGHTS = os.path.join(dir_path, 'data', 'DLPacker_weights')
