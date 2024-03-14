@@ -177,13 +177,29 @@ GRID_SIZE = 40
 SIGMA = 0.65
 
 class TFLayer2Keras(K.layers.Layer):
-    def __init__(self, tf_fn:tf.reshape):
-        self.tf_fn=tf_fn
+    """A custom Keras layer to wrap TensorFlow operations.
 
-    def call(self,tensor,shape:tuple):
-        # Implement the operation causing the issue
-        return self.tf_fn(tensor=tensor, shape=shape)
+    Args:
+        tf_fn: A TensorFlow function that performs the desired operation.
+    """
+    def __init__(self, tf_fn: callable, **kwargs):
+        super().__init__(**kwargs)  # Initialize the parent class.
+        self.tf_fn = tf_fn  # The TensorFlow function to wrap.
 
+    def call(self, *args, **kwargs):
+        """Apply the TensorFlow function."""
+        return self.tf_fn(*args, **kwargs)
+
+    def get_config(self):
+        """Return the configuration of the custom layer.
+
+        Ensures that the model can be saved and loaded correctly.
+        """
+        config = super().get_config().copy()
+        config.update({
+            'tf_fn': self.tf_fn,
+        })
+        return config
 class DLPModel:
     # This class represents DNN model we used in this work
     # If you just want to use the pre-trained weights that
