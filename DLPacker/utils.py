@@ -176,30 +176,36 @@ BOX_SIZE = 10
 GRID_SIZE = 40
 SIGMA = 0.65
 
+
 class TFLayer2Keras(K.layers.Layer):
-    """A custom Keras layer to wrap TensorFlow operations.
+    """A custom Keras layer to wrap TensorFlow functions like tf.reshape.
 
     Args:
-        tf_fn: A TensorFlow function that performs the desired operation.
+        tf_fn_name: The name of the TensorFlow function to perform the desired operation.
+        **kwargs: Additional keyword arguments for the TensorFlow function.
     """
-    def __init__(self, tf_fn: callable, **kwargs):
-        super().__init__(**kwargs)  # Initialize the parent class.
-        self.tf_fn = tf_fn  # The TensorFlow function to wrap.
+    def __init__(self, tf_fn_name: str, **kwargs):
+        super().__init__(**kwargs)
+        self.tf_fn_name = tf_fn_name
+        self.tf_fn_kwargs = kwargs  # Store additional kwargs for the TensorFlow function.
+        # Dynamically retrieve the TensorFlow function based on its name.
+        self.tf_fn = getattr(tf, tf_fn_name, None)
+        if self.tf_fn is None:
+            raise ValueError(f"TensorFlow does not have a function named '{tf_fn_name}'.")
 
-    def call(self, *args, **kwargs):
-        """Apply the TensorFlow function."""
-        return self.tf_fn(*args, **kwargs)
+    def call(self, inputs):
+        """Apply the TensorFlow function with additional kwargs."""
+        return self.tf_fn(inputs, **self.tf_fn_kwargs)
 
     def get_config(self):
-        """Return the configuration of the custom layer.
-
-        Ensures that the model can be saved and loaded correctly.
-        """
+        """Return the configuration of the custom layer."""
         config = super().get_config().copy()
         config.update({
-            'tf_fn': self.tf_fn,
+            'tf_fn_name': self.tf_fn_name,
+            'tf_fn_kwargs': self.tf_fn_kwargs,
         })
         return config
+    
 class DLPModel:
     # This class represents DNN model we used in this work
     # If you just want to use the pre-trained weights that
@@ -342,7 +348,11 @@ class DLPModel:
             self.grid_size * self.grid_size * self.grid_size, activation='relu'
         )(labels)
 
-        fc=TFLayer2Keras(tf_fn=tf.reshape)(tensor=fc, shape=(-1, self.grid_size, self.grid_size, self.grid_size, 1))
+        reshape_layer = TFLayer2Keras(
+            tf_fn_name='reshape', 
+            shape=(-1, self.grid_size, self.grid_size, self.grid_size, 1)
+        )
+        fc = reshape_layer(fc)
 
         l0 = K.layers.Concatenate(axis=-1)([inp, fc])
 
