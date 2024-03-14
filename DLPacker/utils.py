@@ -197,7 +197,7 @@ class DLPModel:
         self.grid_size = grid_size  # grid size
         self.num_channels = num_channels  # number of input channels
         self.batch_size = batch_size
-        self.optimizer = tf.optimizers.Adam(lr) if not is_arm_mac else tf.keras.optimizers.legacy.Adam(lr)
+        self.optimizer = tf.optimizers.Adam(lr) # if not is_arm_mac else tf.keras.optimizers.legacy.Adam(lr)
         self.data_gen = DataGenerator(self.batch_size, folder='./BOXES_TRAIN/')
         self.val_gen = DataGenerator(self.batch_size, folder='./BOXES_VAL/')
 
