@@ -319,6 +319,7 @@ class DLPModel:
             self.grid_size * self.grid_size * self.grid_size, activation='relu'
         )(labels)
 
+
         fc = K.ops.reshape(fc, (-1, self.grid_size, self.grid_size, self.grid_size, 1))
 
         l0 = K.layers.Concatenate(axis=-1)([inp, fc])
