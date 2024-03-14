@@ -43,6 +43,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.keras as K
 
+
 from collections import defaultdict
 
 import os
@@ -175,7 +176,7 @@ BOX_SIZE = 10
 GRID_SIZE = 40
 SIGMA = 0.65
 
-
+    
 class DLPModel:
     # This class represents DNN model we used in this work
     # If you just want to use the pre-trained weights that
@@ -317,9 +318,8 @@ class DLPModel:
         fc = K.layers.Dense(
             self.grid_size * self.grid_size * self.grid_size, activation='relu'
         )(labels)
-        fc = tf.reshape(
-            fc, shape=(-1, self.grid_size, self.grid_size, self.grid_size, 1)
-        )
+
+        fc = K.ops.reshape(fc, (-1, self.grid_size, self.grid_size, self.grid_size, 1))
 
         l0 = K.layers.Concatenate(axis=-1)([inp, fc])
 
