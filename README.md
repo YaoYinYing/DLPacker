@@ -38,8 +38,13 @@ Input stricture might or might not contain side chains, existing side chains, if
 You can find more examples with explanations in the jupyter notebook **[DLPacker.ipynb](DLPacker.ipynb)**.
 
 **Key dependencies:**
-* tensorflow 2.x
+* tensorflow 2.x (use `tensorflow-macos` together with `tensorflow-metal` on Apple Silicon)
 * biopython
+
+The package will automatically make use of CUDA GPUs or Apple's Metal
+Performance Shaders (MPS) when available and fall back to the CPU by
+default. Training and validation steps run under `tf.function` with GPU
+memory growth enabled for better accelerator utilization.
 
 <h2 align="center" style="color:blue">Additional files</h2>
 

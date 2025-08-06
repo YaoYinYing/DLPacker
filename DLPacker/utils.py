@@ -50,7 +50,30 @@ import os
 import tempfile
 import traceback
 import platform
-is_arm_mac=(platform.system() == 'Darwin' and platform.machine()=='arm64')
+
+is_arm_mac = platform.system() == 'Darwin' and platform.machine() == 'arm64'
+
+
+def get_available_device():
+    """Return the best available TensorFlow device.
+
+    Prefers a GPU accelerator (CUDA or Apple's Metal backend) and falls back
+    to CPU when no accelerators are present. TensorFlow reports Apple Silicon
+    GPUs as type ``GPU``, so there's no separate ``MPS`` device listing.
+    """
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except Exception:
+                pass
+        if is_arm_mac:
+            print("Using Apple Metal GPU")
+        else:
+            print("Using CUDA GPU")
+        return "/GPU:0"
+    return "/CPU:0"
 
 
 def fetch_and_unzip_google_drive_link(gdrive_link, output_dir):
@@ -73,11 +96,10 @@ def fetch_and_unzip_google_drive_link(gdrive_link, output_dir):
         url=gdrive_link, output=output_file, quiet=False, fuzzy=True
     )
 
-
     # Extract the downloaded file
     extracted_files = []
     try:
-        
+
         import py7zr
 
         with py7zr.SevenZipFile(output_file, mode='r') as z:
@@ -198,11 +220,18 @@ class DLPModel:
         self.grid_size = grid_size  # grid size
         self.num_channels = num_channels  # number of input channels
         self.batch_size = batch_size
-        self.optimizer = tf.optimizers.Adam(lr) if not is_arm_mac else tf.keras.optimizers.legacy.Adam(lr)
+        self.optimizer = (
+            tf.optimizers.Adam(lr)
+            if not is_arm_mac
+            else tf.keras.optimizers.legacy.Adam(lr)
+        )
         self.data_gen = DataGenerator(self.batch_size, folder='./BOXES_TRAIN/')
         self.val_gen = DataGenerator(self.batch_size, folder='./BOXES_VAL/')
 
-        self.model = self.model()
+        self.device = get_available_device()
+        with tf.device(self.device):
+            self.model = self.model()
+        print(f'Using device: {self.device}')
 
         self.loss_history = {'mae': [], 'roi': []}
         self.ema = 0.999  # for loss history smoothing
@@ -232,18 +261,39 @@ class DLPModel:
             with open(history + '.pkl', 'wb') as f:
                 pickle.dump(self.loss_history, f)
 
+    @tf.function
+    def _train_step(self, x, y, labels):
+        with tf.device(self.device):
+            with tf.GradientTape() as tape:
+                out = self.model([x, labels], training=True)
+                total, mae, roi = self.loss(x[..., :4], y, labels, out)
+            grads = tape.gradient(total, self.model.trainable_variables)
+            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        return mae, roi
+
+    @tf.function
+    def _val_step(self, x, y, labels):
+        with tf.device(self.device):
+            out = self.model([x, labels], training=False)
+            _, mae, roi = self.loss(x[..., :4], y, labels, out)
+        return mae, roi
+
     def train(self, epochs: int):
         for e in range(epochs):
             start = time.time()
             for i, (x, y, labels) in enumerate(self.data_gen):
-                with tf.GradientTape() as tape:
-                    out = self.model([x, labels])
-                    l = self.loss(x[..., :4], y, labels, out)
+                mae, roi = self._train_step(x, y, labels)
+                mae = float(mae.numpy())
+                roi = float(roi.numpy())
+                if self.loss_history['mae']:
+                    mae_ema = mae * (1 - self.ema) + self.ema * self.loss_history['mae'][-1]
+                    self.loss_history['mae'].append(mae_ema)
+                    roi_ema = roi * (1 - self.ema) + self.ema * self.loss_history['roi'][-1]
+                    self.loss_history['roi'].append(roi_ema)
+                else:
+                    self.loss_history['mae'].append(mae)
+                    self.loss_history['roi'].append(roi)
 
-                    grads = tape.gradient(l, self.model.trainable_variables)
-                    self.optimizer.apply_gradients(
-                        zip(grads, self.model.trainable_variables)
-                    )
                 end = time.time()
 
                 print(
@@ -264,45 +314,26 @@ class DLPModel:
                     self.model.save('backup')
 
     def validate(self):
-        count = 0
         maes = []
         rois = []
         for i, (x, y, labels) in enumerate(self.val_gen):
             if i > 0:
                 print('Batch:', i, np.mean(rois), end='\r')
-            out = self.model([x, labels])
-            x = x[..., :4]
-            mae = tf.reduce_mean(tf.math.abs(y - out))
-            mask = np.array(x != y, dtype=np.float32)
-            roi = tf.reduce_mean(tf.math.abs(y - out) * mask) * 100
-
-            maes.append(mae)
-            rois.append(roi)
+            mae, roi = self._val_step(x, y, labels)
+            maes.append(float(mae.numpy()))
+            rois.append(float(roi.numpy()))
 
         print('MAE:', np.mean(maes), 'ROI:', np.mean(rois))
 
-    def loss(self, x, y, labels, out):
+    def _compute_losses(self, x, y, out):
         mae = tf.reduce_mean(tf.math.abs(y - out))
-
-        mask = np.array(x != y, dtype=np.float32)
+        mask = tf.cast(tf.not_equal(x, y), tf.float32)
         roi = tf.reduce_mean(tf.math.abs(y - out) * mask) * 100
+        return mae, roi
 
-        if self.loss_history['mae']:
-            mae_ema = (
-                mae.numpy() * (1 - self.ema)
-                + self.ema * self.loss_history['mae'][-1]
-            )
-            self.loss_history['mae'].append(mae_ema)
-            roi_ema = (
-                roi.numpy() * (1 - self.ema)
-                + self.ema * self.loss_history['roi'][-1]
-            )
-            self.loss_history['roi'].append(roi_ema)
-        else:
-            self.loss_history['mae'].append(mae.numpy())
-            self.loss_history['roi'].append(roi.numpy())
-
-        return roi + mae
+    def loss(self, x, y, labels, out):
+        mae, roi = self._compute_losses(x, y, out)
+        return roi + mae, mae, roi
 
     def model(self):
         width = self.width
@@ -407,9 +438,7 @@ class InputBoxReader:
         ]
 
         # defining a kernel
-        kernel = np.exp(
-            -np.sum(self.grid * self.grid, axis=0) / SIGMA**2 / 2
-        )
+        kernel = np.exp(-np.sum(self.grid * self.grid, axis=0) / SIGMA**2 / 2)
         kernel /= np.sqrt(2 * np.pi) * SIGMA
         self.kernel = kernel[1:-1, 1:-1, 1:-1]
         self.norm = np.sum(self.kernel)
