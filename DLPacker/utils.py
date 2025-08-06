@@ -63,6 +63,11 @@ def get_available_device():
     """
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except Exception:
+                pass
         if is_arm_mac:
             print("Using Apple Metal GPU")
         else:
@@ -256,21 +261,39 @@ class DLPModel:
             with open(history + '.pkl', 'wb') as f:
                 pickle.dump(self.loss_history, f)
 
+    @tf.function
+    def _train_step(self, x, y, labels):
+        with tf.device(self.device):
+            with tf.GradientTape() as tape:
+                out = self.model([x, labels], training=True)
+                total, mae, roi = self.loss(x[..., :4], y, labels, out)
+            grads = tape.gradient(total, self.model.trainable_variables)
+            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        return mae, roi
+
+    @tf.function
+    def _val_step(self, x, y, labels):
+        with tf.device(self.device):
+            out = self.model([x, labels], training=False)
+            _, mae, roi = self.loss(x[..., :4], y, labels, out)
+        return mae, roi
+
     def train(self, epochs: int):
         for e in range(epochs):
             start = time.time()
             for i, (x, y, labels) in enumerate(self.data_gen):
-                with tf.device(self.device):
-                    with tf.GradientTape() as tape:
-                        out = self.model([x, labels])
-                        l = self.loss(x[..., :4], y, labels, out)
+                mae, roi = self._train_step(x, y, labels)
+                mae = float(mae.numpy())
+                roi = float(roi.numpy())
+                if self.loss_history['mae']:
+                    mae_ema = mae * (1 - self.ema) + self.ema * self.loss_history['mae'][-1]
+                    self.loss_history['mae'].append(mae_ema)
+                    roi_ema = roi * (1 - self.ema) + self.ema * self.loss_history['roi'][-1]
+                    self.loss_history['roi'].append(roi_ema)
+                else:
+                    self.loss_history['mae'].append(mae)
+                    self.loss_history['roi'].append(roi)
 
-                        grads = tape.gradient(
-                            l, self.model.trainable_variables
-                        )
-                        self.optimizer.apply_gradients(
-                            zip(grads, self.model.trainable_variables)
-                        )
                 end = time.time()
 
                 print(
@@ -291,46 +314,26 @@ class DLPModel:
                     self.model.save('backup')
 
     def validate(self):
-        count = 0
         maes = []
         rois = []
         for i, (x, y, labels) in enumerate(self.val_gen):
             if i > 0:
                 print('Batch:', i, np.mean(rois), end='\r')
-            with tf.device(self.device):
-                out = self.model([x, labels])
-                x = x[..., :4]
-                mae = tf.reduce_mean(tf.math.abs(y - out))
-                mask = np.array(x != y, dtype=np.float32)
-                roi = tf.reduce_mean(tf.math.abs(y - out) * mask) * 100
-
-            maes.append(mae)
-            rois.append(roi)
+            mae, roi = self._val_step(x, y, labels)
+            maes.append(float(mae.numpy()))
+            rois.append(float(roi.numpy()))
 
         print('MAE:', np.mean(maes), 'ROI:', np.mean(rois))
 
-    def loss(self, x, y, labels, out):
+    def _compute_losses(self, x, y, out):
         mae = tf.reduce_mean(tf.math.abs(y - out))
-
-        mask = np.array(x != y, dtype=np.float32)
+        mask = tf.cast(tf.not_equal(x, y), tf.float32)
         roi = tf.reduce_mean(tf.math.abs(y - out) * mask) * 100
+        return mae, roi
 
-        if self.loss_history['mae']:
-            mae_ema = (
-                mae.numpy() * (1 - self.ema)
-                + self.ema * self.loss_history['mae'][-1]
-            )
-            self.loss_history['mae'].append(mae_ema)
-            roi_ema = (
-                roi.numpy() * (1 - self.ema)
-                + self.ema * self.loss_history['roi'][-1]
-            )
-            self.loss_history['roi'].append(roi_ema)
-        else:
-            self.loss_history['mae'].append(mae.numpy())
-            self.loss_history['roi'].append(roi.numpy())
-
-        return roi + mae
+    def loss(self, x, y, labels, out):
+        mae, roi = self._compute_losses(x, y, out)
+        return roi + mae, mae, roi
 
     def model(self):
         width = self.width

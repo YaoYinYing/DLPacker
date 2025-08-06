@@ -43,7 +43,8 @@ You can find more examples with explanations in the jupyter notebook **[DLPacker
 
 The package will automatically make use of CUDA GPUs or Apple's Metal
 Performance Shaders (MPS) when available and fall back to the CPU by
-default.
+default. Training and validation steps run under `tf.function` with GPU
+memory growth enabled for better accelerator utilization.
 
 <h2 align="center" style="color:blue">Additional files</h2>
 
