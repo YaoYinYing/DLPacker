@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy biopython pytest
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python -m pip install tensorflow-macos tensorflow-metal
+          else
+            python -m pip install tensorflow
+          fi
+          python -m pip install .
+      - name: Run tests
+        run: python -m pytest

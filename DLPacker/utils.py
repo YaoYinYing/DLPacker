@@ -50,7 +50,25 @@ import os
 import tempfile
 import traceback
 import platform
-is_arm_mac=(platform.system() == 'Darwin' and platform.machine()=='arm64')
+
+is_arm_mac = platform.system() == 'Darwin' and platform.machine() == 'arm64'
+
+
+def get_available_device():
+    """Return the best available TensorFlow device.
+
+    Prefers a GPU accelerator (CUDA or Apple's Metal backend) and falls back
+    to CPU when no accelerators are present. TensorFlow reports Apple Silicon
+    GPUs as type ``GPU``, so there's no separate ``MPS`` device listing.
+    """
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        if is_arm_mac:
+            print("Using Apple Metal GPU")
+        else:
+            print("Using CUDA GPU")
+        return "/GPU:0"
+    return "/CPU:0"
 
 
 def fetch_and_unzip_google_drive_link(gdrive_link, output_dir):
@@ -73,11 +91,10 @@ def fetch_and_unzip_google_drive_link(gdrive_link, output_dir):
         url=gdrive_link, output=output_file, quiet=False, fuzzy=True
     )
 
-
     # Extract the downloaded file
     extracted_files = []
     try:
-        
+
         import py7zr
 
         with py7zr.SevenZipFile(output_file, mode='r') as z:
@@ -198,11 +215,18 @@ class DLPModel:
         self.grid_size = grid_size  # grid size
         self.num_channels = num_channels  # number of input channels
         self.batch_size = batch_size
-        self.optimizer = tf.optimizers.Adam(lr) if not is_arm_mac else tf.keras.optimizers.legacy.Adam(lr)
+        self.optimizer = (
+            tf.optimizers.Adam(lr)
+            if not is_arm_mac
+            else tf.keras.optimizers.legacy.Adam(lr)
+        )
         self.data_gen = DataGenerator(self.batch_size, folder='./BOXES_TRAIN/')
         self.val_gen = DataGenerator(self.batch_size, folder='./BOXES_VAL/')
 
-        self.model = self.model()
+        self.device = get_available_device()
+        with tf.device(self.device):
+            self.model = self.model()
+        print(f'Using device: {self.device}')
 
         self.loss_history = {'mae': [], 'roi': []}
         self.ema = 0.999  # for loss history smoothing
@@ -236,14 +260,17 @@ class DLPModel:
         for e in range(epochs):
             start = time.time()
             for i, (x, y, labels) in enumerate(self.data_gen):
-                with tf.GradientTape() as tape:
-                    out = self.model([x, labels])
-                    l = self.loss(x[..., :4], y, labels, out)
+                with tf.device(self.device):
+                    with tf.GradientTape() as tape:
+                        out = self.model([x, labels])
+                        l = self.loss(x[..., :4], y, labels, out)
 
-                    grads = tape.gradient(l, self.model.trainable_variables)
-                    self.optimizer.apply_gradients(
-                        zip(grads, self.model.trainable_variables)
-                    )
+                        grads = tape.gradient(
+                            l, self.model.trainable_variables
+                        )
+                        self.optimizer.apply_gradients(
+                            zip(grads, self.model.trainable_variables)
+                        )
                 end = time.time()
 
                 print(
@@ -270,11 +297,12 @@ class DLPModel:
         for i, (x, y, labels) in enumerate(self.val_gen):
             if i > 0:
                 print('Batch:', i, np.mean(rois), end='\r')
-            out = self.model([x, labels])
-            x = x[..., :4]
-            mae = tf.reduce_mean(tf.math.abs(y - out))
-            mask = np.array(x != y, dtype=np.float32)
-            roi = tf.reduce_mean(tf.math.abs(y - out) * mask) * 100
+            with tf.device(self.device):
+                out = self.model([x, labels])
+                x = x[..., :4]
+                mae = tf.reduce_mean(tf.math.abs(y - out))
+                mask = np.array(x != y, dtype=np.float32)
+                roi = tf.reduce_mean(tf.math.abs(y - out) * mask) * 100
 
             maes.append(mae)
             rois.append(roi)
@@ -407,9 +435,7 @@ class InputBoxReader:
         ]
 
         # defining a kernel
-        kernel = np.exp(
-            -np.sum(self.grid * self.grid, axis=0) / SIGMA**2 / 2
-        )
+        kernel = np.exp(-np.sum(self.grid * self.grid, axis=0) / SIGMA**2 / 2)
         kernel /= np.sqrt(2 * np.pi) * SIGMA
         self.kernel = kernel[1:-1, 1:-1, 1:-1]
         self.norm = np.sum(self.kernel)
