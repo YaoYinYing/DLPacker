@@ -36,6 +36,7 @@ def test_model_forward_cpu_shape():
 
     out = model.model([x, labels]).numpy()
     assert out.shape == (2, 8, 8, 8, 4)
+    assert model.device.type == 'cpu'
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA not available')
@@ -47,6 +48,30 @@ def test_model_forward_cuda_shape():
 
     out = model.model([x, labels]).numpy()
     assert out.shape == (1, 8, 8, 8, 4)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason='MPS not available')
+def test_model_forward_mps_shape():
+    model = DLPModel(grid_size=8, nres=1, num_channels=27, width=4, device='mps')
+    x = np.random.rand(1, 8, 8, 8, 27).astype(np.float32)
+    labels = np.zeros((1, 20), dtype=np.float32)
+    labels[:, 2] = 1.0
+
+    out = model.model([x, labels]).numpy()
+    assert out.shape == (1, 8, 8, 8, 4)
+    assert model.device.type == 'mps'
+
+
+def test_default_device_is_cpu():
+    model = DLPModel(grid_size=8, nres=1, num_channels=27, width=4)
+    assert model.device.type == 'cpu'
+
+
+def test_invalid_unavailable_device_raises():
+    unavailable = 'cuda' if not torch.cuda.is_available() else None
+    if unavailable:
+        with pytest.raises(ValueError, match='not available'):
+            DLPModel(grid_size=8, nres=1, num_channels=27, width=4, device=unavailable)
 
 
 def test_weight_conversion_roundtrip(tmp_path: Path):

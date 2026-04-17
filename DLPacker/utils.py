@@ -405,10 +405,7 @@ class DLPModel:
         self.num_channels = num_channels  # number of input channels
         self.batch_size = batch_size
 
-        if device:
-            self.device = torch.device(device)
-        else:
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = self._resolve_device(device)
 
         self.net = Generator3D(
             width=self.width,
@@ -424,6 +421,29 @@ class DLPModel:
 
         self.loss_history = {'mae': [], 'roi': []}
         self.ema = 0.999  # for loss history smoothing
+
+    @staticmethod
+    def _resolve_device(device: str | None) -> torch.device:
+        # Keep default behavior conservative and portable:
+        # use CPU unless the user explicitly asks for an accelerator.
+        if not device:
+            return torch.device('cpu')
+
+        requested = device.lower()
+        if requested.startswith('cuda'):
+            if not torch.cuda.is_available():
+                raise ValueError("Requested device 'cuda' is not available.")
+            return torch.device(device)
+        if requested.startswith('mps'):
+            if not torch.backends.mps.is_available():
+                raise ValueError("Requested device 'mps' is not available.")
+            return torch.device(device)
+        if requested.startswith('cpu'):
+            return torch.device(device)
+
+        raise ValueError(
+            f"Unsupported device '{device}'. Use one of: cpu, cuda, mps."
+        )
 
     def __str__(self):
         total = sum(p.numel() for p in self.net.parameters())
