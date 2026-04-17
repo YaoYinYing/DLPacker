@@ -50,14 +50,6 @@ if CUSTOMIZED_WEIGHTS_DIR:
 else:
     DEFAULT_WEIGHTS = os.path.join(dir_path, 'data', 'DLPacker_weights')
 
-if not os.path.exists(f'{DEFAULT_WEIGHTS}.h5'):
-    from DLPacker.utils import fetch_and_unzip_weight
-
-    print('Downloading pretrained weight files...')
-    fetch_and_unzip_weight(
-        output_dir=os.path.dirname(DEFAULT_WEIGHTS),
-    )
-
 import numpy as np
 from Bio.PDB import (
     PDBParser,
@@ -72,12 +64,25 @@ from DLPacker.utils import (
     DLPModel,
     InputBoxReader,
     DataGenerator,
+    fetch_and_unzip_weight,
     THE20,
     SCH_ATOMS,
     BB_ATOMS,
     SIDE_CHAINS,
     BOX_SIZE,
 )
+
+
+def _ensure_weights_available(weights_filename: str):
+    if os.path.exists(f'{weights_filename}.pt') or os.path.exists(
+        f'{weights_filename}.h5'
+    ):
+        return
+
+    print('Downloading pretrained weight files...')
+    fetch_and_unzip_weight(
+        output_dir=os.path.dirname(weights_filename),
+    )
 
 
 class DLPacker:
@@ -121,6 +126,7 @@ class DLPacker:
 
         self.model = model
         if not self.model:
+            _ensure_weights_available(weights_filename=weights_filename)
             self.model = DLPModel(width=128, nres=6)
             self.model.load_model(weights=weights_filename)
 

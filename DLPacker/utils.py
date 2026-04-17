@@ -35,63 +35,22 @@
 # SOFTWARE.
 # ==============================================================================
 
-
-import time, os, re
-
-import numpy as np
-
-import tensorflow as tf
-import tensorflow.keras as K
-
-
-from collections import defaultdict
+from __future__ import annotations
 
 import os
+import pickle
+import re
+import time
 import traceback
-import platform
-is_arm_mac=(platform.system() == 'Darwin' and platform.machine()=='arm64')
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Tuple
 
-
-def fetch_and_unzip_weight(output_dir):
-    """
-    Fetches a shared file from a Google Drive link and extracts it from 7-zip format.
-
-    Args:
-    - gdrive_link (str): The Google Drive sharing link of the file.
-    - output_dir (str): The directory where the file will be saved and extracted.
-
-    Returns:
-    - extracted_files (list): List of extracted files if successful, else empty list.
-    """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-
-    import pooch
-    import py7zr
-
-    WEIGHT_URL='https://github.com/YaoYinYing/DLPacker/releases/download/v1.0-alpha/DLPacker_weights.7z'
-    WEIGHT_MD5='md5:0a05db1e8a0468b570402efbd891102b'
-
-    # Extract the downloaded file
-    extracted_files = []
-    try:
-        f=pooch.retrieve(url=WEIGHT_URL, 
-                         known_hash=WEIGHT_MD5,
-                         progressbar=True)
-
-        with py7zr.SevenZipFile(f, mode='r') as z:
-            z.extractall(path=output_dir)
-            extracted_files = os.listdir(output_dir)
-            print(f'Extracted files: {extracted_files}')
-    except Exception:
-        print(f"Extraction failed: ")
-        traceback.print_exc()
-
-    finally:
-        if f and os.path.exists(f):
-            os.remove(f)
-
-    return extracted_files
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, IterableDataset
 
 
 # do not change any of these
@@ -176,7 +135,254 @@ BOX_SIZE = 10
 GRID_SIZE = 40
 SIGMA = 0.65
 
-    
+WEIGHT_URL = 'https://github.com/YaoYinYing/DLPacker/releases/download/v1.0-alpha/DLPacker_weights.7z'
+WEIGHT_MD5 = 'md5:0a05db1e8a0468b570402efbd891102b'
+
+
+def fetch_and_unzip_weight(output_dir: str) -> List[str]:
+    """Fetches pretrained weight archive and extracts into output_dir."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    import pooch
+    import py7zr
+
+    extracted_files: List[str] = []
+    f: str | None = None
+    try:
+        f = pooch.retrieve(url=WEIGHT_URL, known_hash=WEIGHT_MD5, progressbar=True)
+        with py7zr.SevenZipFile(f, mode='r') as z:
+            z.extractall(path=output_dir)
+            extracted_files = os.listdir(output_dir)
+            print(f'Extracted files: {extracted_files}')
+    except Exception:
+        print('Extraction failed:')
+        traceback.print_exc()
+    finally:
+        if f and os.path.exists(f):
+            os.remove(f)
+
+    return extracted_files
+
+
+def _natural_sort_key(text: str) -> List[object]:
+    return [int(tok) if tok.isdigit() else tok for tok in re.split(r'(\d+)', text)]
+
+
+def _collect_h5_datasets(group, prefix: str = '') -> Dict[str, np.ndarray]:
+    import h5py
+
+    out: Dict[str, np.ndarray] = {}
+    for key, item in group.items():
+        path = f'{prefix}/{key}' if prefix else key
+        if isinstance(item, h5py.Dataset):
+            out[path] = item[()]
+        else:
+            out.update(_collect_h5_datasets(item, path))
+    return out
+
+
+def _convert_keras_h5_to_state_dict(
+    keras_h5_path: str,
+    model: 'Generator3D',
+) -> Dict[str, torch.Tensor]:
+    import h5py
+
+    with h5py.File(keras_h5_path, 'r') as f:
+        arrays = _collect_h5_datasets(f)
+
+    dense_kernel = None
+    dense_bias = None
+    conv_layers: Dict[str, Dict[str, np.ndarray]] = {}
+
+    for path, arr in arrays.items():
+        lpath = path.lower()
+        if arr.ndim == 2 and 'kernel' in lpath and 'dense' in lpath:
+            dense_kernel = arr
+            continue
+        if arr.ndim == 1 and 'bias' in lpath and 'dense' in lpath:
+            dense_bias = arr
+            continue
+
+        if arr.ndim == 5 and 'kernel' in lpath:
+            base = path.rsplit('/', 1)[0]
+            conv_layers.setdefault(base, {})['kernel'] = arr
+        elif arr.ndim == 1 and 'bias' in lpath:
+            base = path.rsplit('/', 1)[0]
+            conv_layers.setdefault(base, {})['bias'] = arr
+
+    if dense_kernel is None or dense_bias is None:
+        raise ValueError('Could not find Dense layer kernel/bias in keras .h5 weights.')
+
+    conv_pairs = []
+    for base, tensors in conv_layers.items():
+        if 'kernel' in tensors and 'bias' in tensors:
+            conv_pairs.append((base, tensors['kernel'], tensors['bias']))
+    conv_pairs.sort(key=lambda x: _natural_sort_key(x[0]))
+
+    target_convs = model.ordered_conv_layers()
+    if len(conv_pairs) != len(target_convs):
+        raise ValueError(
+            f'Keras/PyTorch conv layer count mismatch: {len(conv_pairs)} != {len(target_convs)}'
+        )
+
+    state = model.state_dict()
+
+    state['label_fc.weight'] = torch.from_numpy(dense_kernel.T.astype(np.float32))
+    state['label_fc.bias'] = torch.from_numpy(dense_bias.astype(np.float32))
+
+    for (_, k_kernel, k_bias), layer in zip(conv_pairs, target_convs):
+        t_weight = torch.from_numpy(np.transpose(k_kernel, (4, 3, 0, 1, 2)).astype(np.float32))
+        t_bias = torch.from_numpy(k_bias.astype(np.float32))
+
+        if tuple(t_weight.shape) != tuple(state[f'{layer}.weight'].shape):
+            raise ValueError(
+                f'Weight shape mismatch for {layer}.weight: {tuple(t_weight.shape)} != {tuple(state[f"{layer}.weight"].shape)}'
+            )
+        if tuple(t_bias.shape) != tuple(state[f'{layer}.bias'].shape):
+            raise ValueError(
+                f'Bias shape mismatch for {layer}.bias: {tuple(t_bias.shape)} != {tuple(state[f"{layer}.bias"].shape)}'
+            )
+
+        state[f'{layer}.weight'] = t_weight
+        state[f'{layer}.bias'] = t_bias
+
+    return state
+
+
+def convert_keras_h5_to_pt(
+    keras_h5_path: str,
+    out_pt_path: str,
+    width: int = 128,
+    nres: int = 6,
+    grid_size: int = GRID_SIZE,
+    num_channels: int = 27,
+) -> str:
+    model = Generator3D(width=width, nres=nres, grid_size=grid_size, num_channels=num_channels)
+    state = _convert_keras_h5_to_state_dict(keras_h5_path, model)
+    torch.save(
+        {
+            'state_dict': state,
+            'meta': {
+                'width': width,
+                'nres': nres,
+                'grid_size': grid_size,
+                'num_channels': num_channels,
+                'source': os.path.abspath(keras_h5_path),
+            },
+        },
+        out_pt_path,
+    )
+    return out_pt_path
+
+
+class ResidualBlock3D(nn.Module):
+    def __init__(self, in_channels: int, bottleneck_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_channels, bottleneck_channels, kernel_size=1)
+        self.conv2 = nn.Conv3d(bottleneck_channels, bottleneck_channels, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv3d(bottleneck_channels, in_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x = F.relu(self.conv1(x), inplace=False)
+        x = F.relu(self.conv2(x), inplace=False)
+        x = self.conv3(x)
+        x = x + identity
+        return F.relu(x, inplace=False)
+
+
+class Generator3D(nn.Module):
+    def __init__(
+        self,
+        width: int,
+        nres: int,
+        grid_size: int = GRID_SIZE,
+        num_channels: int = 27,
+    ):
+        super().__init__()
+        self.width = width
+        self.nres = nres
+        self.grid_size = grid_size
+        self.num_channels = num_channels
+
+        self.label_fc = nn.Linear(20, grid_size * grid_size * grid_size)
+
+        self.enc1 = nn.Conv3d(num_channels + 1, width, kernel_size=3, stride=2, padding=1)
+        self.enc2 = nn.Conv3d(width, 2 * width, kernel_size=3, stride=2, padding=1)
+        self.enc3 = nn.Conv3d(2 * width, 4 * width, kernel_size=3, stride=1, padding=1)
+
+        self.res_blocks = nn.ModuleList(
+            [ResidualBlock3D(in_channels=4 * width, bottleneck_channels=2 * width) for _ in range(nres)]
+        )
+
+        self.dec1 = nn.Conv3d(6 * width, 4 * width, kernel_size=3, stride=1, padding=1)
+        self.dec2 = nn.Conv3d(5 * width, 2 * width, kernel_size=3, stride=1, padding=1)
+        self.out_conv = nn.Conv3d(2 * width + num_channels, 4, kernel_size=3, stride=1, padding=1)
+
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.2)
+
+    def ordered_conv_layers(self) -> List[str]:
+        names = ['enc1', 'enc2', 'enc3']
+        for i in range(self.nres):
+            names.extend(
+                [
+                    f'res_blocks.{i}.conv1',
+                    f'res_blocks.{i}.conv2',
+                    f'res_blocks.{i}.conv3',
+                ]
+            )
+        names.extend(['dec1', 'dec2', 'out_conv'])
+        return names
+
+    def forward(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        # input x expected in N,C,D,H,W
+        fc = F.relu(self.label_fc(labels), inplace=False)
+        fc = fc.view(-1, 1, self.grid_size, self.grid_size, self.grid_size)
+
+        l0 = torch.cat([x, fc], dim=1)
+
+        l1 = F.relu(self.enc1(l0), inplace=False)
+        l2 = F.relu(self.enc2(l1), inplace=False)
+        l3 = F.relu(self.enc3(l2), inplace=False)
+
+        for block in self.res_blocks:
+            l3 = block(l3)
+
+        l = torch.cat([l3, l2], dim=1)
+        l = self.leaky_relu(self.dec1(l))
+
+        l = F.interpolate(l, scale_factor=2, mode='nearest')
+        l = torch.cat([l, l1], dim=1)
+        l = self.leaky_relu(self.dec2(l))
+
+        l = F.interpolate(l, scale_factor=2, mode='nearest')
+        l = torch.cat([l, x], dim=1)
+        l = self.out_conv(l)
+
+        l = l + x[:, :4, ...]
+        return l
+
+
+class _InferenceModelWrapper:
+    """Keras-like callable wrapper to preserve downstream call sites."""
+
+    def __init__(self, net: Generator3D, device: torch.device):
+        self.net = net
+        self.device = device
+
+    def __call__(self, inputs: List[np.ndarray] | Tuple[np.ndarray, np.ndarray]):
+        x, labels = inputs
+        with torch.no_grad():
+            x_t = torch.as_tensor(x, dtype=torch.float32, device=self.device)
+            labels_t = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
+            # NHWDC -> NCDHW
+            x_t = x_t.permute(0, 4, 1, 2, 3).contiguous()
+            out = self.net(x_t, labels_t)
+            # NCDHW -> NHWDC
+            out = out.permute(0, 2, 3, 4, 1).contiguous().cpu().detach()
+            return out
+
+
 class DLPModel:
     # This class represents DNN model we used in this work
     # If you just want to use the pre-trained weights that
@@ -190,6 +396,7 @@ class DLPModel:
         batch_size: int = 32,
         lr: float = 1e-4,
         width: int = 128,
+        device: str | None = None,
     ):
         self.width = width  # base number of channels
         self.lr = lr  # learning rate
@@ -197,54 +404,125 @@ class DLPModel:
         self.grid_size = grid_size  # grid size
         self.num_channels = num_channels  # number of input channels
         self.batch_size = batch_size
-        self.optimizer = tf.optimizers.Adam(lr) # if not is_arm_mac else tf.keras.optimizers.legacy.Adam(lr)
+
+        if device:
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.net = Generator3D(
+            width=self.width,
+            nres=self.nres,
+            grid_size=self.grid_size,
+            num_channels=self.num_channels,
+        ).to(self.device)
+        self.model = _InferenceModelWrapper(self.net, self.device)
+
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
         self.data_gen = DataGenerator(self.batch_size, folder='./BOXES_TRAIN/')
         self.val_gen = DataGenerator(self.batch_size, folder='./BOXES_VAL/')
-
-        self.model = self.model()
 
         self.loss_history = {'mae': [], 'roi': []}
         self.ema = 0.999  # for loss history smoothing
 
     def __str__(self):
-        print(
-            '3D CNN Model\nLR: {}, BATCH SIZE: {}\n'.format(
-                self.lr, self.batch_size
-            )
-        )
-        self.model.summary(line_length=110)
+        total = sum(p.numel() for p in self.net.parameters())
+        trainable = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+        print(f'3D CNN Model\nLR: {self.lr}, BATCH SIZE: {self.batch_size}\n')
+        print(self.net)
+        print(f'Total parameters: {total}, trainable: {trainable}')
         return 'lol'
 
-    def load_model(self, weights: str, history: str = ''):
-        import pickle
+    def _weights_paths(self, weights: str) -> Tuple[str, str]:
+        return f'{weights}.h5', f'{weights}.pt'
 
-        self.model.load_weights(weights + '.h5')
+    def _ensure_converted_pt(self, weights: str) -> str:
+        h5_path, pt_path = self._weights_paths(weights)
+
+        if os.path.exists(pt_path):
+            if not os.path.exists(h5_path):
+                return pt_path
+            if os.path.getmtime(pt_path) >= os.path.getmtime(h5_path):
+                return pt_path
+
+        if not os.path.exists(h5_path):
+            raise FileNotFoundError(
+                f'No weight file found. Expected either {pt_path} or {h5_path}.'
+            )
+
+        convert_keras_h5_to_pt(
+            keras_h5_path=h5_path,
+            out_pt_path=pt_path,
+            width=self.width,
+            nres=self.nres,
+            grid_size=self.grid_size,
+            num_channels=self.num_channels,
+        )
+        return pt_path
+
+    def load_model(self, weights: str, history: str = ''):
+        pt_path = self._ensure_converted_pt(weights)
+        checkpoint = torch.load(pt_path, map_location=self.device)
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state = checkpoint['state_dict']
+        else:
+            state = checkpoint
+
+        self.net.load_state_dict(state)
+        self.net.to(self.device)
+        self.net.eval()
+
         if history:
             with open(history + '.pkl', 'rb') as h:
                 self.loss_history = pickle.load(h)
 
     def save_model(self, weights: str, history: str = ''):
-        import pickle
-
-        self.model.save_weights(weights + '.h5')
+        _, pt_path = self._weights_paths(weights)
+        torch.save(
+            {
+                'state_dict': self.net.state_dict(),
+                'meta': {
+                    'width': self.width,
+                    'nres': self.nres,
+                    'grid_size': self.grid_size,
+                    'num_channels': self.num_channels,
+                },
+            },
+            pt_path,
+        )
         if history:
             with open(history + '.pkl', 'wb') as f:
                 pickle.dump(self.loss_history, f)
 
+    def _to_torch_batch(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        labels: np.ndarray,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_t = torch.as_tensor(x, dtype=torch.float32, device=self.device)
+        y_t = torch.as_tensor(y, dtype=torch.float32, device=self.device)
+        labels_t = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
+
+        # NHWDC -> NCDHW
+        x_t = x_t.permute(0, 4, 1, 2, 3).contiguous()
+        y_t = y_t.permute(0, 4, 1, 2, 3).contiguous()
+        return x_t, y_t, labels_t
+
     def train(self, epochs: int):
+        self.net.train()
         for e in range(epochs):
             start = time.time()
             for i, (x, y, labels) in enumerate(self.data_gen):
-                with tf.GradientTape() as tape:
-                    out = self.model([x, labels])
-                    l = self.loss(x[..., :4], y, labels, out)
+                x_t, y_t, labels_t = self._to_torch_batch(x, y, labels)
+                self.optimizer.zero_grad(set_to_none=True)
 
-                    grads = tape.gradient(l, self.model.trainable_variables)
-                    self.optimizer.apply_gradients(
-                        zip(grads, self.model.trainable_variables)
-                    )
+                out = self.net(x_t, labels_t)
+                l = self.loss(x_t[:, :4, ...], y_t, labels_t, out)
+                l.backward()
+                self.optimizer.step()
+
                 end = time.time()
-
                 print(
                     'Epoch: %d/%d' % (e + 1, epochs),
                     'Iteration:',
@@ -257,114 +535,52 @@ class DLPModel:
                     ),
                     end='\r',
                 )
-
                 start = time.time()
+
                 if i % 10000 == 0:
-                    self.model.save('backup')
+                    self.save_model('backup')
 
     def validate(self):
-        count = 0
+        self.net.eval()
         maes = []
         rois = []
-        for i, (x, y, labels) in enumerate(self.val_gen):
-            if i > 0:
-                print('Batch:', i, np.mean(rois), end='\r')
-            out = self.model([x, labels])
-            x = x[..., :4]
-            mae = tf.reduce_mean(tf.math.abs(y - out))
-            mask = np.array(x != y, dtype=np.float32)
-            roi = tf.reduce_mean(tf.math.abs(y - out) * mask) * 100
+        with torch.no_grad():
+            for i, (x, y, labels) in enumerate(self.val_gen):
+                if i > 0:
+                    print('Batch:', i, np.mean(rois), end='\r')
+                x_t, y_t, labels_t = self._to_torch_batch(x, y, labels)
+                out = self.net(x_t, labels_t)
 
-            maes.append(mae)
-            rois.append(roi)
+                x4 = x_t[:, :4, ...]
+                mae = torch.mean(torch.abs(y_t - out))
+                mask = (x4 != y_t).to(dtype=torch.float32)
+                roi = torch.mean(torch.abs(y_t - out) * mask) * 100.0
+
+                maes.append(float(mae.cpu().item()))
+                rois.append(float(roi.cpu().item()))
 
         print('MAE:', np.mean(maes), 'ROI:', np.mean(rois))
 
     def loss(self, x, y, labels, out):
-        mae = tf.reduce_mean(tf.math.abs(y - out))
+        del labels  # kept for API compatibility
 
-        mask = np.array(x != y, dtype=np.float32)
-        roi = tf.reduce_mean(tf.math.abs(y - out) * mask) * 100
+        mae = torch.mean(torch.abs(y - out))
+        mask = (x != y).to(dtype=torch.float32)
+        roi = torch.mean(torch.abs(y - out) * mask) * 100.0
+
+        mae_val = float(mae.detach().cpu().item())
+        roi_val = float(roi.detach().cpu().item())
 
         if self.loss_history['mae']:
-            mae_ema = (
-                mae.numpy() * (1 - self.ema)
-                + self.ema * self.loss_history['mae'][-1]
-            )
+            mae_ema = mae_val * (1 - self.ema) + self.ema * self.loss_history['mae'][-1]
             self.loss_history['mae'].append(mae_ema)
-            roi_ema = (
-                roi.numpy() * (1 - self.ema)
-                + self.ema * self.loss_history['roi'][-1]
-            )
+            roi_ema = roi_val * (1 - self.ema) + self.ema * self.loss_history['roi'][-1]
             self.loss_history['roi'].append(roi_ema)
         else:
-            self.loss_history['mae'].append(mae.numpy())
-            self.loss_history['roi'].append(roi.numpy())
+            self.loss_history['mae'].append(mae_val)
+            self.loss_history['roi'].append(roi_val)
 
         return roi + mae
-
-    def model(self):
-        width = self.width
-        inp = K.layers.Input(
-            shape=(
-                self.grid_size,
-                self.grid_size,
-                self.grid_size,
-                self.num_channels,
-            )
-        )
-        labels = K.layers.Input(shape=(20,))
-
-        fc = K.layers.Dense(
-            self.grid_size * self.grid_size * self.grid_size, activation='relu'
-        )(labels)
-
-
-        fc = K.ops.reshape(fc, (-1, self.grid_size, self.grid_size, self.grid_size, 1))
-
-        l0 = K.layers.Concatenate(axis=-1)([inp, fc])
-
-        def res_identity(x, f1, f2):
-            x_in = x
-            x = K.layers.Conv3D(
-                f1, 1, strides=1, padding='valid', activation='relu'
-            )(x)
-            x = K.layers.Conv3D(
-                f1, 3, strides=1, padding='same', activation='relu'
-            )(x)
-            x = K.layers.Conv3D(f2, 1, strides=1, padding='valid')(x)
-            x = K.layers.Add()([x, x_in])
-            return K.layers.Activation('relu')(x)
-
-        l1 = K.layers.Conv3D(
-            1 * width, 3, padding='same', strides=2, activation='relu'
-        )(l0)
-        l2 = K.layers.Conv3D(
-            2 * width, 3, padding='same', strides=2, activation='relu'
-        )(l1)
-        l3 = K.layers.Conv3D(
-            4 * width, 3, padding='same', strides=1, activation='relu'
-        )(l2)
-
-        for _ in range(self.nres):
-            l3 = res_identity(l3, 2 * width, 4 * width)
-
-        l = K.layers.Concatenate(axis=-1)([l3, l2])
-        l = K.layers.Conv3D(4 * width, 3, padding='same')(l)
-        l = K.layers.LeakyReLU(alpha=0.2)(l)
-
-        l = K.layers.UpSampling3D(size=2)(l)
-        l = K.layers.Concatenate(axis=-1)([l, l1])
-        l = K.layers.Conv3D(2 * width, 3, padding='same')(l)
-        l = K.layers.LeakyReLU(alpha=0.2)(l)
-
-        l = K.layers.UpSampling3D(size=2)(l)
-        l = K.layers.Concatenate(axis=-1)([l, inp])
-        l = K.layers.Conv3D(4, 3, padding='same')(l)
-
-        l = l + inp[..., :4]
-
-        return K.Model(inputs=[inp, labels], outputs=l, name='Generator')
 
 
 class InputBoxReader:
@@ -406,9 +622,7 @@ class InputBoxReader:
         ]
 
         # defining a kernel
-        kernel = np.exp(
-            -np.sum(self.grid * self.grid, axis=0) / SIGMA**2 / 2
-        )
+        kernel = np.exp(-np.sum(self.grid * self.grid, axis=0) / SIGMA**2 / 2)
         kernel /= np.sqrt(2 * np.pi) * SIGMA
         self.kernel = kernel[1:-1, 1:-1, 1:-1]
         self.norm = np.sum(self.kernel)
@@ -418,8 +632,8 @@ class InputBoxReader:
         with open(charges_filename, 'r') as f:
             for line in f:
                 if line[0] == '[' or line[0] == ' ':
-                    if re.match('\A\[ .{1,3} \]\Z', line[:-1]):
-                        key = re.match('\A\[ (.{1,3}) \]\Z', line[:-1])[1]
+                    if re.match(r'\A\[ .{1,3} \]\Z', line[:-1]):
+                        key = re.match(r'\A\[ (.{1,3}) \]\Z', line[:-1])[1]
                         self.charges[key] = defaultdict(lambda: 0)
                     else:
                         l = re.split(r' +', line[:-1])
@@ -443,16 +657,14 @@ class InputBoxReader:
             # and 50% chance to remove random fraction of them
             if np.random.rand() < 0.25:
                 p = np.random.rand()
-                amino_acids = set(
-                    [a for a in amino_acids if np.random.rand() < p]
-                )
+                amino_acids = set([a for a in amino_acids if np.random.rand() < p])
             else:
                 amino_acids = set()
         elif self.remove_sidechains == 'all':
             amino_acids = set()
 
-        x = np.zeros([self.total_size, self.total_size, self.total_size, 27])
-        y = np.zeros([self.total_size, self.total_size, self.total_size, 4])
+        x = np.zeros([self.total_size, self.total_size, self.total_size, 27], dtype=np.float32)
+        y = np.zeros([self.total_size, self.total_size, self.total_size, 4], dtype=np.float32)
 
         centers = (np.array(box['positions']) + BOX_SIZE) / self.grid_spacing
         centers += self.offset
@@ -509,10 +721,7 @@ class InputBoxReader:
                     # by partial charge value
                     if aa in self.charges:
                         # if charge value is known, use it
-                        charge = kernel * self.charges[aa][an]
-                        x[xa:xb, ya:yb, za:zb, 5] += (
-                            kernel * self.charges[aa][an]
-                        )
+                        x[xa:xb, ya:yb, za:zb, 5] += kernel * self.charges[aa][an]
                     else:
                         # otherwise use default values
                         charge = kernel * self.charges['RST'][an[:1]]
@@ -527,47 +736,59 @@ class InputBoxReader:
         return x[b:-b, b:-b, b:-b, :], y[b:-b, b:-b, b:-b, :]
 
 
-class DataGenerator(tf.data.Dataset):
-    # Pretty standard data denerator based on tf.data.Dataset
-    def _generator(
+class _DLPBoxesIterable(IterableDataset):
+    def __init__(
+        self,
         num_channels: int,
         grid_size: int,
         randomize: bool,
         folder: str,
         remove_sidechains: str,
     ):
-        folder = folder.decode('utf-8')
-        remove_sidechains = remove_sidechains.decode('utf-8')
-        # The target file structure is as folows:
-        # withing the `folder` there are multiple subfolders named by PDB codes
-        # and each subfolder contains .npz files with dictionaries stored
-        # and named like this example: 1a2z_C_PHE_179.npz
-        # so the final filename is like this: `folder`/1a2z/1a2z_C_PHE_179.npz
-        files = []
-        for f in os.listdir(folder):
-            ff = os.listdir(folder + f)
-            for file in ff:
-                files.append(folder + f + '/' + file)
+        super().__init__()
+        self.num_channels = num_channels
+        self.grid_size = grid_size
+        self.randomize = randomize
+        self.folder = folder
+        self.remove_sidechains = remove_sidechains
 
-        if randomize:
+    def _list_files(self) -> List[str]:
+        files: List[str] = []
+        if not self.folder or not os.path.isdir(self.folder):
+            return files
+
+        for f in os.listdir(self.folder):
+            ff_path = os.path.join(self.folder, f)
+            if not os.path.isdir(ff_path):
+                continue
+            for file in os.listdir(ff_path):
+                files.append(os.path.join(ff_path, file))
+
+        if self.randomize:
             np.random.shuffle(files)
+        return files
 
-        input_reader = InputBoxReader(remove_sidechains=remove_sidechains)
+    def __iter__(self) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        files = self._list_files()
+        input_reader = InputBoxReader(remove_sidechains=self.remove_sidechains)
 
-        x = np.zeros((grid_size, grid_size, grid_size, num_channels))
-        y = np.zeros((grid_size, grid_size, grid_size, 4))
+        if self.folder and not self.folder.endswith(os.sep):
+            folder_prefix = self.folder + os.sep
+        else:
+            folder_prefix = self.folder
 
-        # these two constants just derived from the
-        # filename to locate amino acid name (see above)
-        s = len(folder) + 12
+        s = len(folder_prefix) + 12
         e = s + 3
 
-        for sample_idx in range(len(files)):
+        for sample_path in files:
             label = np.zeros((20), dtype=np.float32)
-            label[THE20[files[sample_idx][s:e]]] = 1
-            x, y = input_reader(files[sample_idx])
+            label[THE20[sample_path[s:e]]] = 1
+            x, y = input_reader(sample_path)
             yield x, y, label
 
+
+class DataGenerator:
+    # Pretty standard data generator preserving the old API surface.
     def __new__(
         cls,
         batch_size: int = 32,
@@ -577,31 +798,11 @@ class DataGenerator(tf.data.Dataset):
         remove_sidechains: str = 'all',
         folder: str = '',
     ):
-        ds = tf.data.Dataset.range(2)
-        ds = ds.interleave(
-            lambda x: tf.data.Dataset.from_generator(
-                cls._generator,
-                output_signature=(
-                    tf.TensorSpec(
-                        shape=(grid_size, grid_size, grid_size, num_channels),
-                        dtype=tf.float32,
-                    ),
-                    tf.TensorSpec(
-                        shape=(grid_size, grid_size, grid_size, 4),
-                        dtype=tf.float32,
-                    ),
-                    tf.TensorSpec(shape=(20), dtype=tf.float32),
-                ),
-                args=(
-                    num_channels,
-                    grid_size,
-                    randomize,
-                    folder,
-                    remove_sidechains,
-                ),
-            ),
-            cycle_length=2,
-            block_length=1,
-            num_parallel_calls=2,
+        dataset = _DLPBoxesIterable(
+            num_channels=num_channels,
+            grid_size=grid_size,
+            randomize=randomize,
+            folder=folder,
+            remove_sidechains=remove_sidechains,
         )
-        return ds.batch(batch_size).prefetch(tf.data.experimental.AUTOTUNE)
+        return DataLoader(dataset, batch_size=batch_size)

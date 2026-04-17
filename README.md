@@ -38,12 +38,14 @@ Input stricture might or might not contain side chains, existing side chains, if
 You can find more examples with explanations in the jupyter notebook **[DLPacker.ipynb](DLPacker.ipynb)**.
 
 **Key dependencies:**
-* tensorflow 2.x
+* pytorch 2.3+
 * biopython
 
 <h2 align="center" style="color:blue">Additional files</h2>
 
-This repo does not contain neural network's weights due to their large size. You will need to download them from [here](https://drive.google.com/file/d/1J4fV9aAr2nssrWN8mQ7Ui-9PVQseE0LQ/view?usp=sharing).
+This repo does not contain neural network's weights due to their large size. The runtime will download the released archive from [here](https://github.com/YaoYinYing/DLPacker/releases/download/v1.0-alpha/DLPacker_weights.7z) when needed.
+
+Pretrained compatibility is preserved by converting legacy `DLPacker_weights.h5` to `DLPacker_weights.pt` once and using the PyTorch checkpoint afterward.
 
 <h2 align="center">Performance</h2>
 
