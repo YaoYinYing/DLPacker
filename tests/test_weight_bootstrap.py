@@ -183,3 +183,39 @@ def test_dlpacker_callsite_uses_unified_bootstrap(monkeypatch: pytest.MonkeyPatc
         'backoff_seconds': 1.0,
         'fetch_if_missing': True,
     }
+
+
+def test_dlpacker_loads_weights_for_passed_uninitialized_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    pdb_file = tmp_path / 'mini.pdb'
+    pdb_file.write_text(
+        (
+            "ATOM      1  N   ALA A   1      -3.274  -1.500  -1.169  1.00 27.30           N\n"
+            "ATOM      2  CA  ALA A   1      -2.468  -1.500   0.000  1.00 27.66           C\n"
+            "ATOM      3  C   ALA A   1      -3.379  -1.500   1.222  1.00 28.10           C\n"
+            "ATOM      4  O   ALA A   1      -4.000  -1.500   2.100  1.00 28.10           O\n"
+            "END\n"
+        )
+    )
+
+    called = {'ensure': 0, 'load': 0}
+
+    def _fake_ensure(*, weights_prefix: str, max_attempts: int, backoff_seconds: float, fetch_if_missing: bool):
+        called['ensure'] += 1
+        return weights_prefix + '.pt'
+
+    def _fake_load(self, weights: str, history: str = ''):
+        called['load'] += 1
+        self.weights_loaded = True
+
+    monkeypatch.setattr(dlp_mod, 'ensure_pretrained_weights', _fake_ensure)
+    monkeypatch.setattr(dlp_mod.DLPModel, 'load_model', _fake_load)
+
+    model = dlp_mod.DLPModel(grid_size=8, nres=1, width=4, device='cpu')
+    assert model.weights_loaded is False
+
+    dlp_mod.DLPacker(str_pdb=str(pdb_file), model=model)
+    assert called['ensure'] == 1
+    assert called['load'] == 1
+    assert model.weights_loaded is True

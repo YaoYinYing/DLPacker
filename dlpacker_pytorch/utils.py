@@ -206,7 +206,11 @@ def _fetch_and_extract_once(output_dir: str) -> List[str]:
     import pooch
     import py7zr
 
-    archive_path = pooch.retrieve(url=WEIGHT_URL, known_hash=WEIGHT_MD5, progressbar=True)
+    archive_path = pooch.retrieve(
+        url=WEIGHT_URL,
+        known_hash=WEIGHT_MD5,
+        progressbar=False,
+    )
     extracted_files: List[str] = []
     staging_dir = tempfile.mkdtemp(prefix='dlpacker_weights_extract_', dir=output_dir)
     try:
@@ -574,6 +578,7 @@ class DLPModel:
 
         self.loss_history = {'mae': [], 'roi': []}
         self.ema = 0.999  # for loss history smoothing
+        self.weights_loaded = False
 
     @staticmethod
     def _resolve_device(device: str | None) -> torch.device:
@@ -628,6 +633,7 @@ class DLPModel:
         self.net.load_state_dict(state)
         self.net.to(self.device)
         self.net.eval()
+        self.weights_loaded = True
 
         if history:
             with open(history + '.pkl', 'rb') as h:

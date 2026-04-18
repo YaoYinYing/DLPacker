@@ -130,6 +130,12 @@ class DLPacker:
             _ensure_weights_available(weights_filename=weights_filename)
             self.model = DLPModel(width=128, nres=6)
             self.model.load_model(weights=weights_filename)
+        elif isinstance(self.model, DLPModel):
+            # If caller passes a raw DLPModel(device=...), load pretrained
+            # weights automatically to avoid accidental random-weight inference.
+            if not self.model.weights_loaded:
+                _ensure_weights_available(weights_filename=weights_filename)
+                self.model.load_model(weights=weights_filename)
 
         self.input_reader = input_reader
         if not self.input_reader:
