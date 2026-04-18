@@ -149,7 +149,7 @@ def check_structure(
     p1 = float(np.percentile(nearest, 1))
     p5 = float(np.percentile(nearest, 5))
 
-    severe: List[ClashRecord] = []
+    severe_map: Dict[Tuple[Tuple[str, int, str, str], Tuple[str, int, str, str]], ClashRecord] = {}
     for i, d in enumerate(nearest):
         if float(d) >= clash_threshold:
             continue
@@ -160,14 +160,17 @@ def check_structure(
         b = atoms[j]
         if a.get_parent() == b.get_parent():
             continue
-        severe.append(
-            ClashRecord(
-                distance=float(d),
-                atom_a=(a.get_full_id()[2], a.get_parent().get_id()[1], a.get_parent().get_resname(), a.get_name()),
-                atom_b=(b.get_full_id()[2], b.get_parent().get_id()[1], b.get_parent().get_resname(), b.get_name()),
-            )
+        rec = ClashRecord(
+            distance=float(d),
+            atom_a=(a.get_full_id()[2], a.get_parent().get_id()[1], a.get_parent().get_resname(), a.get_name()),
+            atom_b=(b.get_full_id()[2], b.get_parent().get_id()[1], b.get_parent().get_resname(), b.get_name()),
         )
+        key = tuple(sorted([rec.atom_a, rec.atom_b]))
+        cur = severe_map.get(key)
+        if cur is None or rec.distance < cur.distance:
+            severe_map[key] = rec
 
+    severe = list(severe_map.values())
     severe.sort(key=lambda x: x.distance)
     severe = severe[: max(0, int(top_n_clashes))]
 
@@ -205,6 +208,15 @@ def format_report(report: StructureCheckReport) -> str:
             f'  clash {c.distance:.3f}A: {a[0]}/{a[1]}/{a[2]}/{a[3]} -- {b[0]}/{b[1]}/{b[2]}/{b[3]}'
         )
     return '\n'.join(lines)
+
+
+def clash_residue_targets(report: StructureCheckReport) -> List[Tuple[int, str, str]]:
+    out = set()
+    for c in report.severe_clashes:
+        for atom in (c.atom_a, c.atom_b):
+            chain, resid, resname, _ = atom
+            out.add((int(resid), chain, resname))
+    return sorted(out)
 
 
 def compare_reports(

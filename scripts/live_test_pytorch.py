@@ -13,6 +13,7 @@ import numpy as np
 from dlpacker_pytorch import DLPacker
 from dlpacker_pytorch.dlpacker import DEFAULT_WEIGHTS
 from dlpacker_pytorch.structure_checker import (
+    clash_residue_targets,
     check_structure,
     compare_reports,
     format_delta,
@@ -102,6 +103,11 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help='Also compare checker report against original input structure.',
     )
+    parser.add_argument(
+        '--auto-repair-clashes',
+        action='store_true',
+        help='If severe clashes are found, repack only clashing residues with steric policy and re-check.',
+    )
     return parser.parse_args()
 
 
@@ -161,6 +167,7 @@ def main() -> int:
     dlp.reconstruct_protein(order=args.order, output_filename=str(output_pdb))
 
     if args.run_structure_check:
+        before = None
         report = check_structure(
             str(output_pdb),
             clash_threshold=float(args.check_clash_threshold),
@@ -180,6 +187,39 @@ def main() -> int:
                 top_n=20,
             )
             print(format_delta(delta), flush=True)
+
+        if args.auto_repair_clashes and report.severe_clashes:
+            targets = clash_residue_targets(report)
+            print(
+                f'Auto-repair: repacking {len(targets)} clashing residues with steric policy...',
+                flush=True,
+            )
+            prev_policy = dlp.rotamer_policy
+            dlp.rotamer_policy = 'steric'
+            dlp.reconstruct_region(
+                targets=targets,
+                order='natoms',
+                refine_only=True,
+                output_filename=str(output_pdb),
+            )
+            dlp.rotamer_policy = prev_policy
+            repaired = check_structure(
+                str(output_pdb),
+                clash_threshold=float(args.check_clash_threshold),
+                top_n_clashes=20,
+            )
+            print('Post-repair check:', flush=True)
+            print(format_report(repaired), flush=True)
+            if before is not None:
+                repaired_delta = compare_reports(
+                    before=before,
+                    after=repaired,
+                    clash_threshold=float(args.check_clash_threshold),
+                    top_n=20,
+                )
+                print(format_delta(repaired_delta), flush=True)
+            report = repaired
+
         if args.check_fail_on_severe and report.severe_clashes:
             raise RuntimeError(
                 f'Structure checker found {len(report.severe_clashes)} severe clashes.'

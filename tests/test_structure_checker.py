@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dlpacker_pytorch.structure_checker import check_structure, compare_reports
+from dlpacker_pytorch.structure_checker import (
+    check_structure,
+    clash_residue_targets,
+    compare_reports,
+)
 
 
 def test_structure_checker_reports_clean_fixture(data_dir: Path):
@@ -32,6 +36,11 @@ def test_structure_checker_detects_severe_overlap(tmp_path: Path):
     report = check_structure(str(pdb), clash_threshold=1.0, top_n_clashes=10)
     assert report.min_inter_residue_distance < 0.1
     assert len(report.severe_clashes) > 0
+    # deduped clash list should not double-count symmetric pairs, but
+    # multiple unique atom-atom clashes are expected in this synthetic case.
+    assert len(report.severe_clashes) <= 10
+    targets = clash_residue_targets(report)
+    assert len(targets) == 2
 
 
 def test_compare_reports_tracks_worsened_clashes(tmp_path: Path):
