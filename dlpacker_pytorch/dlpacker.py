@@ -497,16 +497,8 @@ class DLPacker:
         # truncate
         pred = pred[5:-5, 5:-5, 5:-5, :]
 
-        # downsample
-        dpred = np.zeros((15, 15, 15, 4))
-        for i in range(0, 30, 2):
-            for j in range(0, 30, 2):
-                for k in range(0, 30, 2):
-                    v = np.mean(
-                        pred[i : i + 2, j : j + 2, k : k + 2, :],
-                        axis=(0, 1, 2),
-                    )
-                    dpred[i // 2, j // 2, k // 2, :] = v
+        # downsample (vectorized equivalent of 2x2x2 block averaging)
+        dpred = pred.reshape(15, 2, 15, 2, 15, 2, 4).mean(axis=(1, 3, 5))
 
         # summ all the channels if not Asn, Gln or His
         if label not in ['ASN', 'GLN', 'HIS']:
