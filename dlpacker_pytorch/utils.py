@@ -609,8 +609,12 @@ class Generator3D(nn.Module):
 
         self.label_fc = nn.Linear(20, grid_size * grid_size * grid_size)
 
-        self.enc1 = nn.Conv3d(num_channels + 1, width, kernel_size=3, stride=2, padding=1)
-        self.enc2 = nn.Conv3d(width, 2 * width, kernel_size=3, stride=2, padding=1)
+        # TensorFlow's Conv3D(..., strides=2, padding='same') uses asymmetric
+        # padding for even-sized inputs (e.g., 40 -> 20), unlike PyTorch
+        # padding=1 which is symmetric. Keep weights identical and emulate
+        # TF padding in forward() before these stride-2 convolutions.
+        self.enc1 = nn.Conv3d(num_channels + 1, width, kernel_size=3, stride=2, padding=0)
+        self.enc2 = nn.Conv3d(width, 2 * width, kernel_size=3, stride=2, padding=0)
         self.enc3 = nn.Conv3d(2 * width, 4 * width, kernel_size=3, stride=1, padding=1)
 
         self.res_blocks = nn.ModuleList(
@@ -643,8 +647,11 @@ class Generator3D(nn.Module):
 
         l0 = torch.cat([x, fc], dim=1)
 
-        l1 = F.relu(self.enc1(l0), inplace=False)
-        l2 = F.relu(self.enc2(l1), inplace=False)
+        # Emulate TF SAME padding for stride=2, kernel=3:
+        # for 40->20 and 20->10 stages, total pad is 1 and applied to the
+        # "right" side of each axis in channels_last layout.
+        l1 = F.relu(self.enc1(F.pad(l0, (0, 1, 0, 1, 0, 1))), inplace=False)
+        l2 = F.relu(self.enc2(F.pad(l1, (0, 1, 0, 1, 0, 1))), inplace=False)
         l3 = F.relu(self.enc3(l2), inplace=False)
 
         for block in self.res_blocks:
