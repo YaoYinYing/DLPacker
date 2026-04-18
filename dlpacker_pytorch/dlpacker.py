@@ -102,6 +102,7 @@ class DLPacker:
         lib_name: str = DEFAULT_LIBRARY_NPZ,
         weights_filename: str = DEFAULT_WEIGHTS,
         charges_filename: str = DEFAULT_CHARGES_RTP,
+        rotamer_policy: str = 'hybrid',
     ):
         # Input:
         # str_pdb      - filename of the PDB structure we will be working with
@@ -116,6 +117,10 @@ class DLPacker:
 
         self.box_size = BOX_SIZE  # do not change
         self.altloc = ['A', 'B']  # initial altloc selection order preference
+        self.rotamer_policy = rotamer_policy
+        assert self.rotamer_policy in ['tf', 'steric', 'hybrid'], (
+            "rotamer_policy should be 'tf', 'steric', or 'hybrid'"
+        )
 
         self.str_pdb = str_pdb
         self.ref_pdb = ref_pdb  # reference atoms to align residues to
@@ -544,6 +549,19 @@ class DLPacker:
         # If all top-k candidates clash, choose the least-clashing one.
         return fallback_idx
 
+    def _candidate_min_env_distance(
+        self,
+        residue: Residue,
+        label: str,
+        candidate_index: int,
+    ) -> float:
+        env = self._local_environment_coords(residue, cutoff=8.0)
+        if env.shape[0] == 0:
+            return float('inf')
+        coords = self.library['coords'][label][int(candidate_index)].astype(np.float32)
+        d = np.linalg.norm(coords[:, None, :] - env[None, :, :], axis=-1)
+        return float(np.min(d))
+
     def _get_prediction(self, box: dict, label: str):
         # Runs NN prediction to get density
 
@@ -624,11 +642,31 @@ class DLPacker:
         # this block runs reconstruction of the residue
         scores = np.abs(self.library['grids'][n] - pred)
         scores = np.mean(scores, axis=tuple(range(1, pred.ndim + 1)))
-        best_ind = self._select_rotamer_with_steric_filter(
-            residue=residue,
-            label=n,
-            raw_scores=scores,
-        )
+        if self.rotamer_policy == 'steric':
+            best_ind = self._select_rotamer_with_steric_filter(
+                residue=residue,
+                label=n,
+                raw_scores=scores,
+            )
+        elif self.rotamer_policy == 'tf':
+            # Strict TF-mirror policy: pure density ranking.
+            best_ind = int(np.argmin(scores))
+        else:
+            # Hybrid: start with TF top-1 and only override if it clashes hard.
+            tf_idx = int(np.argmin(scores))
+            tf_min_d = self._candidate_min_env_distance(
+                residue=residue,
+                label=n,
+                candidate_index=tf_idx,
+            )
+            if tf_min_d < 1.0:
+                best_ind = self._select_rotamer_with_steric_filter(
+                    residue=residue,
+                    label=n,
+                    raw_scores=scores,
+                )
+            else:
+                best_ind = tf_idx
         best_score = np.min(scores)
         best_match = self.library['coords'][n][best_ind]
 

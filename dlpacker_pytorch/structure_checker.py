@@ -9,6 +9,28 @@ from Bio.PDB import PDBParser, Selection
 
 from dlpacker_pytorch.utils import SIDE_CHAINS, THE20
 
+EXPECTED_BONDS: Dict[str, List[Tuple[str, str]]] = {
+    'ALA': [('CA', 'CB')],
+    'ARG': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD'), ('CD', 'NE'), ('NE', 'CZ'), ('CZ', 'NH1'), ('CZ', 'NH2')],
+    'ASN': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'OD1'), ('CG', 'ND2')],
+    'ASP': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'OD1'), ('CG', 'OD2')],
+    'CYS': [('CA', 'CB'), ('CB', 'SG')],
+    'GLN': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD'), ('CD', 'OE1'), ('CD', 'NE2')],
+    'GLU': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD'), ('CD', 'OE1'), ('CD', 'OE2')],
+    'HIS': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'ND1'), ('CG', 'CD2'), ('ND1', 'CE1'), ('CD2', 'NE2')],
+    'ILE': [('CA', 'CB'), ('CB', 'CG1'), ('CB', 'CG2'), ('CG1', 'CD1')],
+    'LEU': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD1'), ('CG', 'CD2')],
+    'LYS': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD'), ('CD', 'CE'), ('CE', 'NZ')],
+    'MET': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'SD'), ('SD', 'CE')],
+    'PHE': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD1'), ('CG', 'CD2'), ('CD1', 'CE1'), ('CD2', 'CE2'), ('CE1', 'CZ'), ('CE2', 'CZ')],
+    'PRO': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD')],
+    'SER': [('CA', 'CB'), ('CB', 'OG')],
+    'THR': [('CA', 'CB'), ('CB', 'OG1'), ('CB', 'CG2')],
+    'TRP': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD1'), ('CG', 'CD2'), ('CD1', 'NE1'), ('CD2', 'CE2'), ('CD2', 'CE3'), ('CE2', 'CZ2'), ('CE3', 'CZ3'), ('CZ2', 'CH2'), ('CZ3', 'CH2')],
+    'TYR': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD1'), ('CG', 'CD2'), ('CD1', 'CE1'), ('CD2', 'CE2'), ('CE1', 'CZ'), ('CE2', 'CZ'), ('CZ', 'OH')],
+    'VAL': [('CA', 'CB'), ('CB', 'CG1'), ('CB', 'CG2')],
+}
+
 
 @dataclass
 class ClashRecord:
@@ -25,6 +47,7 @@ class StructureCheckReport:
     p1_inter_residue_distance: float
     p5_inter_residue_distance: float
     missing_sidechain_atoms: List[Tuple[str, int, str, str]]
+    bond_length_outliers: List[Tuple[str, int, str, str, str, float]]
     severe_clashes: List[ClashRecord]
 
 
@@ -79,6 +102,35 @@ def _missing_sidechain_atoms(structure) -> List[Tuple[str, int, str, str]]:
     return out
 
 
+def _bond_length_outliers(
+    structure,
+    *,
+    lower: float = 1.0,
+    upper: float = 2.2,
+) -> List[Tuple[str, int, str, str, str, float]]:
+    out: List[Tuple[str, int, str, str, str, float]] = []
+    for residue in Selection.unfold_entities(structure, 'R'):
+        name = residue.get_resname()
+        if name not in THE20:
+            continue
+        chain = residue.get_full_id()[2]
+        resid = residue.get_id()[1]
+
+        for a1, a2 in [('N', 'CA'), ('CA', 'C')]:
+            if residue.has_id(a1) and residue.has_id(a2):
+                d = float(np.linalg.norm(residue[a1].coord - residue[a2].coord))
+                if d < lower or d > upper:
+                    out.append((chain, resid, name, a1, a2, d))
+
+        if name in EXPECTED_BONDS:
+            for a1, a2 in EXPECTED_BONDS[name]:
+                if residue.has_id(a1) and residue.has_id(a2):
+                    d = float(np.linalg.norm(residue[a1].coord - residue[a2].coord))
+                    if d < lower or d > upper:
+                        out.append((chain, resid, name, a1, a2, d))
+    return out
+
+
 def check_structure(
     pdb_path: str | Path,
     *,
@@ -126,6 +178,7 @@ def check_structure(
         p1_inter_residue_distance=p1,
         p5_inter_residue_distance=p5,
         missing_sidechain_atoms=_missing_sidechain_atoms(structure),
+        bond_length_outliers=_bond_length_outliers(structure),
         severe_clashes=severe,
     )
 
@@ -136,10 +189,15 @@ def format_report(report: StructureCheckReport) -> str:
         f'Heavy atoms: {report.heavy_atom_count}',
         f'Inter-residue nearest distances: min={report.min_inter_residue_distance:.3f}A p1={report.p1_inter_residue_distance:.3f}A p5={report.p5_inter_residue_distance:.3f}A',
         f'Missing sidechain atoms: {len(report.missing_sidechain_atoms)}',
+        f'Bond-length outliers: {len(report.bond_length_outliers)}',
         f'Severe clashes (< threshold): {len(report.severe_clashes)}',
     ]
     for chain, resid, resname, atom in report.missing_sidechain_atoms[:20]:
         lines.append(f'  missing: {chain}/{resid}/{resname}/{atom}')
+    for chain, resid, resname, a1, a2, d in report.bond_length_outliers[:20]:
+        lines.append(
+            f'  bond outlier {d:.3f}A: {chain}/{resid}/{resname}/{a1}-{a2}'
+        )
     for c in report.severe_clashes[:20]:
         a = c.atom_a
         b = c.atom_b

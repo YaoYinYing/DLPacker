@@ -55,9 +55,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--order',
-        default='sequence',
+        default='natoms',
         choices=['sequence', 'natoms', 'score'],
         help='Reconstruction order heuristic.',
+    )
+    parser.add_argument(
+        '--rotamer-policy',
+        default='hybrid',
+        choices=['tf', 'steric', 'hybrid'],
+        help='Rotamer selection policy: tf (pure ranking), steric (clash-aware), or hybrid (tf with clash fallback).',
     )
     parser.add_argument(
         '--out',
@@ -134,7 +140,11 @@ def main() -> int:
     print(f'Device: {args.device}', flush=True)
 
     model = DLPModel(device=args.device)
-    dlp = DLPacker(str(input_pdb), model=model)
+    dlp = DLPacker(
+        str(input_pdb),
+        model=model,
+        rotamer_policy=args.rotamer_policy,
+    )
 
     pt_path = ensure_pretrained_weights(DEFAULT_WEIGHTS)
     h5_path = f'{DEFAULT_WEIGHTS}.h5'
@@ -146,6 +156,7 @@ def main() -> int:
     print(f'  pt_sha256: {info["sha256"]}', flush=True)
     meta = info.get('meta', {})
     print(f'  converter_version: {meta.get("converter_version", "n/a")}', flush=True)
+    print(f'  rotamer_policy: {args.rotamer_policy}', flush=True)
 
     dlp.reconstruct_protein(order=args.order, output_filename=str(output_pdb))
 
