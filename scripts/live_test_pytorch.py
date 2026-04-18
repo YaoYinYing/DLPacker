@@ -12,6 +12,12 @@ import numpy as np
 
 from dlpacker_pytorch import DLPacker
 from dlpacker_pytorch.dlpacker import DEFAULT_WEIGHTS
+from dlpacker_pytorch.structure_checker import (
+    check_structure,
+    compare_reports,
+    format_delta,
+    format_report,
+)
 from dlpacker_pytorch.tf_parity import (
     load_tf_model_from_h5,
     postprocess_prediction,
@@ -69,6 +75,27 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help='Top-k size for TF/PT rotamer overlap when --parity-target is set.',
     )
+    parser.add_argument(
+        '--run-structure-check',
+        action='store_true',
+        help='Run geometry checker on output PDB and print a report.',
+    )
+    parser.add_argument(
+        '--check-clash-threshold',
+        type=float,
+        default=1.0,
+        help='Severe clash threshold (A) for structure checker.',
+    )
+    parser.add_argument(
+        '--check-fail-on-severe',
+        action='store_true',
+        help='Exit with non-zero code if severe clashes are found.',
+    )
+    parser.add_argument(
+        '--check-compare-input',
+        action='store_true',
+        help='Also compare checker report against original input structure.',
+    )
     return parser.parse_args()
 
 
@@ -121,6 +148,31 @@ def main() -> int:
     print(f'  converter_version: {meta.get("converter_version", "n/a")}', flush=True)
 
     dlp.reconstruct_protein(order=args.order, output_filename=str(output_pdb))
+
+    if args.run_structure_check:
+        report = check_structure(
+            str(output_pdb),
+            clash_threshold=float(args.check_clash_threshold),
+            top_n_clashes=20,
+        )
+        print(format_report(report), flush=True)
+        if args.check_compare_input:
+            before = check_structure(
+                str(input_pdb),
+                clash_threshold=float(args.check_clash_threshold),
+                top_n_clashes=20,
+            )
+            delta = compare_reports(
+                before=before,
+                after=report,
+                clash_threshold=float(args.check_clash_threshold),
+                top_n=20,
+            )
+            print(format_delta(delta), flush=True)
+        if args.check_fail_on_severe and report.severe_clashes:
+            raise RuntimeError(
+                f'Structure checker found {len(report.severe_clashes)} severe clashes.'
+            )
 
     if args.parity_target:
         resid_s, chain, label = [x.strip() for x in args.parity_target.split(',')]
