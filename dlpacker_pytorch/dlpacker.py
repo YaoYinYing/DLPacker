@@ -60,11 +60,12 @@ from Bio.PDB import (
     Residue,
     Structure,
 )
-from DLPacker.utils import (
+from dlpacker_pytorch.utils import (
     DLPModel,
     InputBoxReader,
     DataGenerator,
-    fetch_and_unzip_weight,
+    ensure_pretrained_weights,
+    WeightBootstrapError,
     THE20,
     SCH_ATOMS,
     BB_ATOMS,
@@ -74,15 +75,15 @@ from DLPacker.utils import (
 
 
 def _ensure_weights_available(weights_filename: str):
-    if os.path.exists(f'{weights_filename}.pt') or os.path.exists(
-        f'{weights_filename}.h5'
-    ):
-        return
-
-    print('Downloading pretrained weight files...')
-    fetch_and_unzip_weight(
-        output_dir=os.path.dirname(weights_filename),
-    )
+    try:
+        ensure_pretrained_weights(
+            weights_prefix=weights_filename,
+            max_attempts=3,
+            backoff_seconds=1.0,
+            fetch_if_missing=True,
+        )
+    except WeightBootstrapError:
+        raise
 
 
 class DLPacker:

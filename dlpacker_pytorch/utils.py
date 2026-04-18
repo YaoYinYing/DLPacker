@@ -40,8 +40,9 @@ from __future__ import annotations
 import os
 import pickle
 import re
+import shutil
+import tempfile
 import time
-import traceback
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Tuple
@@ -139,29 +140,177 @@ WEIGHT_URL = 'https://github.com/YaoYinYing/DLPacker/releases/download/v1.0-alph
 WEIGHT_MD5 = 'md5:0a05db1e8a0468b570402efbd891102b'
 
 
-def fetch_and_unzip_weight(output_dir: str) -> List[str]:
-    """Fetches pretrained weight archive and extracts into output_dir."""
+class WeightBootstrapError(RuntimeError):
+    """Raised when pretrained weight bootstrap cannot produce a valid checkpoint."""
+
+
+def _validate_pt_checkpoint(path: str) -> None:
+    checkpoint = torch.load(path, map_location='cpu')
+    if isinstance(checkpoint, dict):
+        if 'state_dict' in checkpoint:
+            state = checkpoint['state_dict']
+            if not isinstance(state, dict) or not state:
+                raise ValueError("'.pt' checkpoint has empty or invalid 'state_dict'.")
+        elif not checkpoint:
+            raise ValueError("'.pt' checkpoint is an empty dict.")
+    else:
+        raise ValueError("'.pt' checkpoint must be a dict-like object.")
+
+
+def _validate_h5_weights(path: str) -> None:
+    import h5py
+
+    with h5py.File(path, 'r') as f:
+        has_dataset = False
+
+        def _visitor(_, obj):
+            nonlocal has_dataset
+            if isinstance(obj, h5py.Dataset):
+                has_dataset = True
+
+        f.visititems(_visitor)
+        if not has_dataset:
+            raise ValueError("'.h5' file does not contain any datasets.")
+
+
+def _build_weight_error(
+    weights_prefix: str,
+    attempted_paths: List[str],
+    last_error: Exception,
+) -> WeightBootstrapError:
+    output_dir = os.path.dirname(os.path.abspath(weights_prefix))
+    h5_path = f'{weights_prefix}.h5'
+    pt_path = f'{weights_prefix}.pt'
+    msg = (
+        'Failed to bootstrap pretrained DLPacker weights.\n'
+        f'Attempted paths:\n  - {h5_path}\n  - {pt_path}\n'
+        f'Weight URL: {WEIGHT_URL}\n'
+        f'Output directory: {output_dir}\n'
+        f'Root cause: {type(last_error).__name__}: {last_error}\n'
+        'Manual remediation:\n'
+        f'  1) Ensure the directory is writable: {output_dir}\n'
+        f'  2) Download/extract archive so `{os.path.basename(h5_path)}` exists in that directory.\n'
+        f'  3) Convert manually:\n'
+        f'     python scripts/convert_keras_weights.py --weights-prefix {weights_prefix}\n'
+        '  4) Optional override directory:\n'
+        '     export DLPACKER_PRETRAINED_WEIGHT=/path/to/weights_dir\n'
+        f'Failed attempts: {len(attempted_paths)}'
+    )
+    return WeightBootstrapError(msg)
+
+
+def _fetch_and_extract_once(output_dir: str) -> List[str]:
+    """Fetches pretrained archive and extracts into output_dir atomically."""
     os.makedirs(output_dir, exist_ok=True)
 
     import pooch
     import py7zr
 
+    archive_path = pooch.retrieve(url=WEIGHT_URL, known_hash=WEIGHT_MD5, progressbar=True)
     extracted_files: List[str] = []
-    f: str | None = None
+    staging_dir = tempfile.mkdtemp(prefix='dlpacker_weights_extract_', dir=output_dir)
     try:
-        f = pooch.retrieve(url=WEIGHT_URL, known_hash=WEIGHT_MD5, progressbar=True)
-        with py7zr.SevenZipFile(f, mode='r') as z:
-            z.extractall(path=output_dir)
-            extracted_files = os.listdir(output_dir)
-            print(f'Extracted files: {extracted_files}')
-    except Exception:
-        print('Extraction failed:')
-        traceback.print_exc()
+        with py7zr.SevenZipFile(archive_path, mode='r') as z:
+            z.extractall(path=staging_dir)
+        for name in os.listdir(staging_dir):
+            src = os.path.join(staging_dir, name)
+            dst = os.path.join(output_dir, name)
+            os.replace(src, dst)
+            extracted_files.append(name)
     finally:
-        if f and os.path.exists(f):
-            os.remove(f)
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     return extracted_files
+
+
+def ensure_pretrained_weights(
+    weights_prefix: str,
+    *,
+    max_attempts: int = 3,
+    backoff_seconds: float = 1.0,
+    fetch_if_missing: bool = True,
+) -> str:
+    """Ensures a valid `<weights_prefix>.pt` exists, fetching/converting if needed."""
+    if max_attempts < 1:
+        raise ValueError('max_attempts must be >= 1')
+    if backoff_seconds < 0:
+        raise ValueError('backoff_seconds must be >= 0')
+
+    h5_path = f'{weights_prefix}.h5'
+    pt_path = f'{weights_prefix}.pt'
+    out_dir = os.path.dirname(os.path.abspath(weights_prefix))
+    os.makedirs(out_dir, exist_ok=True)
+
+    attempted_paths: List[str] = []
+    last_error: Exception | None = None
+
+    def _try_validate_or_convert() -> str:
+        if os.path.exists(pt_path):
+            try:
+                _validate_pt_checkpoint(pt_path)
+                return pt_path
+            except Exception:
+                # Corrupt checkpoint should not be trusted.
+                os.remove(pt_path)
+        if os.path.exists(h5_path):
+            _validate_h5_weights(h5_path)
+            tmp_pt = f'{pt_path}.tmp'
+            if os.path.exists(tmp_pt):
+                os.remove(tmp_pt)
+            try:
+                convert_keras_h5_to_pt(keras_h5_path=h5_path, out_pt_path=tmp_pt)
+                _validate_pt_checkpoint(tmp_pt)
+                os.replace(tmp_pt, pt_path)
+            except Exception:
+                if os.path.exists(tmp_pt):
+                    os.remove(tmp_pt)
+                raise
+            return pt_path
+        raise FileNotFoundError(
+            f'No weight file found. Expected either {pt_path} or {h5_path}.'
+        )
+
+    attempts = max_attempts if fetch_if_missing else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return _try_validate_or_convert()
+        except Exception as exc:
+            last_error = exc
+            attempted_paths.append(f'attempt={attempt}: {type(exc).__name__}: {exc}')
+            if not fetch_if_missing:
+                break
+            # Clear stale artifacts before retrying fresh fetch/extract.
+            for stale in (pt_path, h5_path, f'{pt_path}.tmp'):
+                if os.path.exists(stale):
+                    try:
+                        os.remove(stale)
+                    except Exception:
+                        pass
+            try:
+                extracted = _fetch_and_extract_once(out_dir)
+                print(f'Extracted files: {extracted}')
+            except Exception as fetch_exc:
+                last_error = fetch_exc
+                attempted_paths.append(
+                    f'attempt={attempt}: {type(fetch_exc).__name__}: {fetch_exc}'
+                )
+            if attempt < attempts and backoff_seconds > 0:
+                time.sleep(backoff_seconds * (2 ** (attempt - 1)))
+
+    assert last_error is not None
+    raise _build_weight_error(weights_prefix, attempted_paths, last_error)
+
+
+def fetch_and_unzip_weight(output_dir: str) -> List[str]:
+    """Backward-compatible helper used by callers that only need fetch/extract."""
+    try:
+        return _fetch_and_extract_once(output_dir=output_dir)
+    except Exception as exc:
+        raise _build_weight_error(
+            weights_prefix=os.path.join(output_dir, 'DLPacker_weights'),
+            attempted_paths=[f'fetch_only: {type(exc).__name__}: {exc}'],
+            last_error=exc,
+        ) from exc
 
 
 def _natural_sort_key(text: str) -> List[object]:
@@ -259,6 +408,9 @@ def convert_keras_h5_to_pt(
 ) -> str:
     model = Generator3D(width=width, nres=nres, grid_size=grid_size, num_channels=num_channels)
     state = _convert_keras_h5_to_state_dict(keras_h5_path, model)
+    tmp_out = f'{out_pt_path}.tmp'
+    if os.path.exists(tmp_out):
+        os.remove(tmp_out)
     torch.save(
         {
             'state_dict': state,
@@ -270,8 +422,9 @@ def convert_keras_h5_to_pt(
                 'source': os.path.abspath(keras_h5_path),
             },
         },
-        out_pt_path,
+        tmp_out,
     )
+    os.replace(tmp_out, out_pt_path)
     return out_pt_path
 
 
@@ -457,28 +610,12 @@ class DLPModel:
         return f'{weights}.h5', f'{weights}.pt'
 
     def _ensure_converted_pt(self, weights: str) -> str:
-        h5_path, pt_path = self._weights_paths(weights)
-
-        if os.path.exists(pt_path):
-            if not os.path.exists(h5_path):
-                return pt_path
-            if os.path.getmtime(pt_path) >= os.path.getmtime(h5_path):
-                return pt_path
-
-        if not os.path.exists(h5_path):
-            raise FileNotFoundError(
-                f'No weight file found. Expected either {pt_path} or {h5_path}.'
-            )
-
-        convert_keras_h5_to_pt(
-            keras_h5_path=h5_path,
-            out_pt_path=pt_path,
-            width=self.width,
-            nres=self.nres,
-            grid_size=self.grid_size,
-            num_channels=self.num_channels,
+        return ensure_pretrained_weights(
+            weights_prefix=weights,
+            max_attempts=3,
+            backoff_seconds=1.0,
+            fetch_if_missing=True,
         )
-        return pt_path
 
     def load_model(self, weights: str, history: str = ''):
         pt_path = self._ensure_converted_pt(weights)

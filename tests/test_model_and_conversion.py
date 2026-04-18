@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from DLPacker.utils import DLPModel, Generator3D, convert_keras_h5_to_pt
+from dlpacker_pytorch.utils import DLPModel, Generator3D, convert_keras_h5_to_pt
 
 
 def _write_fake_keras_h5(path: Path, model: Generator3D) -> None:
@@ -147,4 +147,4 @@ def test_conversion_parity_output(tmp_path: Path):
 
 def test_import_without_tensorflow_dependency():
     assert importlib.util.find_spec('tensorflow') is None
-    import DLPacker  # noqa: F401
+    import dlpacker_pytorch  # noqa: F401

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from DLPacker.utils import InputBoxReader, THE20
+from dlpacker_pytorch.utils import InputBoxReader, THE20
 
 
 def test_input_box_reader_shapes_and_channels(data_dir):

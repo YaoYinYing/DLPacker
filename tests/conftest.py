@@ -7,8 +7,8 @@ import pytest
 import torch
 from Bio.PDB import Selection
 
-from DLPacker.dlpacker import DLPacker
-from DLPacker.utils import InputBoxReader
+from dlpacker_pytorch.dlpacker import DLPacker
+from dlpacker_pytorch.utils import InputBoxReader
 
 
 class _IdentityPredictor:
@@ -25,7 +25,7 @@ class DummyModel:
 
 @pytest.fixture
 def data_dir() -> Path:
-    return Path(__file__).resolve().parents[1] / 'DLPacker' / 'data'
+    return Path(__file__).resolve().parents[1] / 'dlpacker_pytorch' / 'data'
 
 
 @pytest.fixture

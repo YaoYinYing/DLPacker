@@ -28,7 +28,7 @@ Input may contain any protein/protein complex/RNA/DNA/small molecules etc. Only 
 As easy as three lines of code:
 
 ```python
-from dlpacker import DLPacker
+from dlpacker_pytorch import DLPacker
 dlp = DLPacker('my_structure.pdb')
 dlp.reconstruct_protein(order = 'sequence', output_filename = 'my_structure_repacked.pdb')
 ```

@@ -2,7 +2,7 @@
 
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 
-from DLPacker.utils import convert_keras_h5_to_pt
+from dlpacker_pytorch.utils import convert_keras_h5_to_pt
 
 
 parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
