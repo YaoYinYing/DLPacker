@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--pdb-id',
-        default='4p0d',
+        default='1ubq',
         help='RCSB PDB id to download (ignored if --pdb-file is provided).',
     )
     parser.add_argument(
