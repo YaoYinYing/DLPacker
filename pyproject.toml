@@ -36,6 +36,11 @@ py7zr = "0.20.8"
 pytest = ">=8.0"
 pytest-cov = ">=5.0"
 
+[tool.pytest.ini_options]
+markers = [
+  "tf_parity: TensorFlow-vs-PyTorch parity checks (optional; requires TensorFlow)."
+]
+
 [tool.black]
 line-length = 79
 target-version = ['py38']

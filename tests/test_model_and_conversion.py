@@ -8,7 +8,13 @@ import numpy as np
 import pytest
 import torch
 
-from dlpacker_pytorch.utils import DLPModel, Generator3D, convert_keras_h5_to_pt
+from dlpacker_pytorch.utils import (
+    CONVERTER_VERSION,
+    DLPModel,
+    Generator3D,
+    checkpoint_info,
+    convert_keras_h5_to_pt,
+)
 
 
 def _write_fake_keras_h5(path: Path, model: Generator3D) -> None:
@@ -100,6 +106,14 @@ def test_weight_conversion_roundtrip(tmp_path: Path):
     checkpoint = torch.load(pt_path, map_location='cpu')
     converted_state = checkpoint['state_dict']
     src_state = source.state_dict()
+    assert checkpoint['meta']['converter_version'] == CONVERTER_VERSION
+    assert checkpoint['meta']['arch'] == {
+        'width': width,
+        'nres': nres,
+        'grid_size': grid_size,
+        'num_channels': num_channels,
+    }
+    assert len(checkpoint['meta']['source_h5_sha256']) == 64
 
     assert set(converted_state.keys()) == set(src_state.keys())
     for key in src_state:
@@ -146,5 +160,46 @@ def test_conversion_parity_output(tmp_path: Path):
 
 
 def test_import_without_tensorflow_dependency():
-    assert importlib.util.find_spec('tensorflow') is None
+    if importlib.util.find_spec('tensorflow') is not None:
+        pytest.skip('TensorFlow is installed in this environment.')
     import dlpacker_pytorch  # noqa: F401
+
+
+def test_checkpoint_info_reads_meta(tmp_path: Path):
+    model = Generator3D(width=2, nres=1, grid_size=4, num_channels=3)
+    h5_path = tmp_path / 'weights.h5'
+    pt_path = tmp_path / 'weights.pt'
+    _write_fake_keras_h5(h5_path, model)
+    convert_keras_h5_to_pt(
+        keras_h5_path=str(h5_path),
+        out_pt_path=str(pt_path),
+        width=2,
+        nres=1,
+        grid_size=4,
+        num_channels=3,
+    )
+    info = checkpoint_info(str(pt_path))
+    assert info['has_state_dict'] is True
+    assert info['state_key_count'] > 0
+    meta = info['meta']
+    assert meta['converter_version'] == CONVERTER_VERSION
+    assert meta['source_h5'].endswith('weights.h5')
+
+
+def test_conversion_fails_on_unexpected_h5_tensor(tmp_path: Path):
+    model = Generator3D(width=2, nres=1, grid_size=4, num_channels=3)
+    h5_path = tmp_path / 'weights_bad.h5'
+    pt_path = tmp_path / 'weights_bad.pt'
+    _write_fake_keras_h5(h5_path, model)
+    with h5py.File(h5_path, 'a') as f:
+        g = f.require_group('model_weights').require_group('weird')
+        g.create_dataset('kernel:0', data=np.zeros((1, 1, 1, 1, 1), dtype=np.float32))
+    with pytest.raises(ValueError, match='Unexpected tensor paths'):
+        convert_keras_h5_to_pt(
+            keras_h5_path=str(h5_path),
+            out_pt_path=str(pt_path),
+            width=2,
+            nres=1,
+            grid_size=4,
+            num_channels=3,
+        )

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import hashlib
 import re
 import shutil
 import tempfile
@@ -138,6 +139,7 @@ SIGMA = 0.65
 
 WEIGHT_URL = 'https://github.com/YaoYinYing/DLPacker/releases/download/v1.0-alpha/DLPacker_weights.7z'
 WEIGHT_MD5 = 'md5:0a05db1e8a0468b570402efbd891102b'
+CONVERTER_VERSION = '2'
 
 
 class WeightBootstrapError(RuntimeError):
@@ -155,6 +157,50 @@ def _validate_pt_checkpoint(path: str) -> None:
             raise ValueError("'.pt' checkpoint is an empty dict.")
     else:
         raise ValueError("'.pt' checkpoint must be a dict-like object.")
+
+
+def _sha256_file(path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _arch_signature(
+    *,
+    width: int,
+    nres: int,
+    grid_size: int,
+    num_channels: int,
+) -> Dict[str, int]:
+    return {
+        'width': int(width),
+        'nres': int(nres),
+        'grid_size': int(grid_size),
+        'num_channels': int(num_channels),
+    }
+
+
+def checkpoint_info(path: str) -> Dict[str, object]:
+    checkpoint = torch.load(path, map_location='cpu')
+    if not isinstance(checkpoint, dict):
+        raise ValueError('Checkpoint must be a dictionary.')
+    meta = checkpoint.get('meta', {})
+    state = checkpoint.get('state_dict', checkpoint)
+    if not isinstance(state, dict):
+        raise ValueError('Checkpoint state_dict is invalid.')
+    return {
+        'path': os.path.abspath(path),
+        'sha256': _sha256_file(path),
+        'has_state_dict': isinstance(state, dict) and bool(state),
+        'state_key_count': len(state),
+        'meta': meta if isinstance(meta, dict) else {},
+    }
+
+
+def file_sha256(path: str) -> str:
+    return _sha256_file(path)
 
 
 def _validate_h5_weights(path: str) -> None:
@@ -187,6 +233,9 @@ def _build_weight_error(
         f'Weight URL: {WEIGHT_URL}\n'
         f'Output directory: {output_dir}\n'
         f'Root cause: {type(last_error).__name__}: {last_error}\n'
+        'Accepted .pt policy:\n'
+        '  - .pt must be structurally valid\n'
+        '  - .pt meta must include converter fingerprint and match source .h5\n'
         'Manual remediation:\n'
         f'  1) Ensure the directory is writable: {output_dir}\n'
         f'  2) Download/extract archive so `{os.path.basename(h5_path)}` exists in that directory.\n'
@@ -247,23 +296,62 @@ def ensure_pretrained_weights(
 
     attempted_paths: List[str] = []
     last_error: Exception | None = None
+    expected_arch = _arch_signature(width=128, nres=6, grid_size=GRID_SIZE, num_channels=27)
+
+    def _pt_matches_expected_meta(path: str) -> Tuple[bool, str]:
+        checkpoint = torch.load(path, map_location='cpu')
+        if not isinstance(checkpoint, dict):
+            return False, 'checkpoint is not a dict'
+        meta = checkpoint.get('meta')
+        if not isinstance(meta, dict):
+            return False, 'checkpoint missing meta'
+
+        if meta.get('converter_version') != CONVERTER_VERSION:
+            return False, 'converter_version mismatch'
+
+        meta_arch = meta.get('arch')
+        if not isinstance(meta_arch, dict):
+            return False, 'checkpoint missing arch signature'
+        for key, value in expected_arch.items():
+            if int(meta_arch.get(key, -1)) != value:
+                return False, f'arch mismatch for {key}'
+
+        if not os.path.exists(h5_path):
+            return False, 'source .h5 missing for fingerprint validation'
+
+        h5_sha = _sha256_file(h5_path)
+        if meta.get('source_h5_sha256') != h5_sha:
+            return False, 'source_h5_sha256 mismatch'
+
+        return True, 'ok'
 
     def _try_validate_or_convert() -> str:
+        if os.path.exists(h5_path):
+            _validate_h5_weights(h5_path)
         if os.path.exists(pt_path):
             try:
                 _validate_pt_checkpoint(pt_path)
-                return pt_path
+                valid, reason = _pt_matches_expected_meta(pt_path)
+                if valid:
+                    return pt_path
+                attempted_paths.append(f'pt_rebuild_required: {reason}')
             except Exception:
-                # Corrupt checkpoint should not be trusted.
+                attempted_paths.append('pt_rebuild_required: corrupt checkpoint')
+            # stale/unsafe checkpoint should not be trusted.
+            if os.path.exists(pt_path):
                 os.remove(pt_path)
         if os.path.exists(h5_path):
-            _validate_h5_weights(h5_path)
             tmp_pt = f'{pt_path}.tmp'
             if os.path.exists(tmp_pt):
                 os.remove(tmp_pt)
             try:
                 convert_keras_h5_to_pt(keras_h5_path=h5_path, out_pt_path=tmp_pt)
                 _validate_pt_checkpoint(tmp_pt)
+                valid, reason = _pt_matches_expected_meta(tmp_pt)
+                if not valid:
+                    raise ValueError(
+                        f'Converted checkpoint failed semantic validation: {reason}'
+                    )
                 os.replace(tmp_pt, pt_path)
             except Exception:
                 if os.path.exists(tmp_pt):
@@ -334,6 +422,32 @@ def _collect_h5_datasets(group, prefix: str = '') -> Dict[str, np.ndarray]:
     return out
 
 
+def _strip_model_weights_prefix(path: str) -> str:
+    if path.startswith('model_weights/'):
+        return path[len('model_weights/') :]
+    return path
+
+
+def _match_dense_dataset(path: str) -> str | None:
+    norm = _strip_model_weights_prefix(path)
+    m = re.fullmatch(r'dense(?:/dense)?/(kernel:0|bias:0)', norm)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _match_conv_dataset(path: str) -> Tuple[int, str] | None:
+    norm = _strip_model_weights_prefix(path)
+    m = re.fullmatch(
+        r'(conv3d(?:_(\d+))?)(?:/\1)?/(kernel:0|bias:0)',
+        norm,
+    )
+    if not m:
+        return None
+    idx = int(m.group(2)) if m.group(2) is not None else 0
+    return idx, m.group(3)
+
+
 def _convert_keras_h5_to_state_dict(
     keras_h5_path: str,
     model: 'Generator3D',
@@ -343,39 +457,60 @@ def _convert_keras_h5_to_state_dict(
     with h5py.File(keras_h5_path, 'r') as f:
         arrays = _collect_h5_datasets(f)
 
+    target_convs = model.ordered_conv_layers()
     dense_kernel = None
     dense_bias = None
-    conv_layers: Dict[str, Dict[str, np.ndarray]] = {}
+    conv_layers: Dict[int, Dict[str, np.ndarray]] = {}
+    unexpected_tensors: List[str] = []
 
     for path, arr in arrays.items():
-        lpath = path.lower()
-        if arr.ndim == 2 and 'kernel' in lpath and 'dense' in lpath:
-            dense_kernel = arr
+        if arr.ndim not in (1, 2, 5):
             continue
-        if arr.ndim == 1 and 'bias' in lpath and 'dense' in lpath:
-            dense_bias = arr
+        dense_kind = _match_dense_dataset(path)
+        if dense_kind:
+            if dense_kind == 'kernel:0':
+                if arr.ndim != 2:
+                    raise ValueError(f'Unexpected dense kernel shape at {path}: {arr.shape}')
+                if dense_kernel is not None:
+                    raise ValueError(f'Duplicate dense kernel dataset found at {path}')
+                dense_kernel = arr
+            else:
+                if arr.ndim != 1:
+                    raise ValueError(f'Unexpected dense bias shape at {path}: {arr.shape}')
+                if dense_bias is not None:
+                    raise ValueError(f'Duplicate dense bias dataset found at {path}')
+                dense_bias = arr
             continue
 
-        if arr.ndim == 5 and 'kernel' in lpath:
-            base = path.rsplit('/', 1)[0]
-            conv_layers.setdefault(base, {})['kernel'] = arr
-        elif arr.ndim == 1 and 'bias' in lpath:
-            base = path.rsplit('/', 1)[0]
-            conv_layers.setdefault(base, {})['bias'] = arr
+        conv_match = _match_conv_dataset(path)
+        if conv_match:
+            idx, tensor_kind = conv_match
+            tensors = conv_layers.setdefault(idx, {})
+            if tensor_kind in tensors:
+                raise ValueError(f'Duplicate conv tensor {tensor_kind} at {path}')
+            if tensor_kind == 'kernel:0' and arr.ndim != 5:
+                raise ValueError(f'Unexpected conv kernel shape at {path}: {arr.shape}')
+            if tensor_kind == 'bias:0' and arr.ndim != 1:
+                raise ValueError(f'Unexpected conv bias shape at {path}: {arr.shape}')
+            tensors[tensor_kind] = arr
+            continue
+
+        if path.endswith('kernel:0') or path.endswith('bias:0'):
+            unexpected_tensors.append(path)
+
+    if unexpected_tensors:
+        raise ValueError(
+            'Unexpected tensor paths in keras .h5: '
+            + ', '.join(sorted(unexpected_tensors))
+        )
 
     if dense_kernel is None or dense_bias is None:
-        raise ValueError('Could not find Dense layer kernel/bias in keras .h5 weights.')
+        raise ValueError('Could not find exact Dense layer kernel/bias in keras .h5 weights.')
 
-    conv_pairs = []
-    for base, tensors in conv_layers.items():
-        if 'kernel' in tensors and 'bias' in tensors:
-            conv_pairs.append((base, tensors['kernel'], tensors['bias']))
-    conv_pairs.sort(key=lambda x: _natural_sort_key(x[0]))
-
-    target_convs = model.ordered_conv_layers()
-    if len(conv_pairs) != len(target_convs):
+    if sorted(conv_layers.keys()) != list(range(len(target_convs))):
         raise ValueError(
-            f'Keras/PyTorch conv layer count mismatch: {len(conv_pairs)} != {len(target_convs)}'
+            f'Conv index mismatch in keras .h5: found={sorted(conv_layers.keys())}, '
+            f'expected=0..{len(target_convs)-1}'
         )
 
     state = model.state_dict()
@@ -383,7 +518,12 @@ def _convert_keras_h5_to_state_dict(
     state['label_fc.weight'] = torch.from_numpy(dense_kernel.T.astype(np.float32))
     state['label_fc.bias'] = torch.from_numpy(dense_bias.astype(np.float32))
 
-    for (_, k_kernel, k_bias), layer in zip(conv_pairs, target_convs):
+    for idx, layer in enumerate(target_convs):
+        tensors = conv_layers[idx]
+        if 'kernel:0' not in tensors or 'bias:0' not in tensors:
+            raise ValueError(f'Missing conv tensors for conv index {idx}')
+        k_kernel = tensors['kernel:0']
+        k_bias = tensors['bias:0']
         t_weight = torch.from_numpy(np.transpose(k_kernel, (4, 3, 0, 1, 2)).astype(np.float32))
         t_bias = torch.from_numpy(k_bias.astype(np.float32))
 
@@ -412,6 +552,7 @@ def convert_keras_h5_to_pt(
 ) -> str:
     model = Generator3D(width=width, nres=nres, grid_size=grid_size, num_channels=num_channels)
     state = _convert_keras_h5_to_state_dict(keras_h5_path, model)
+    source_h5_sha256 = _sha256_file(keras_h5_path)
     tmp_out = f'{out_pt_path}.tmp'
     if os.path.exists(tmp_out):
         os.remove(tmp_out)
@@ -419,11 +560,15 @@ def convert_keras_h5_to_pt(
         {
             'state_dict': state,
             'meta': {
-                'width': width,
-                'nres': nres,
-                'grid_size': grid_size,
-                'num_channels': num_channels,
-                'source': os.path.abspath(keras_h5_path),
+                'source_h5': os.path.abspath(keras_h5_path),
+                'source_h5_sha256': source_h5_sha256,
+                'converter_version': CONVERTER_VERSION,
+                'arch': _arch_signature(
+                    width=width,
+                    nres=nres,
+                    grid_size=grid_size,
+                    num_channels=num_channels,
+                ),
             },
         },
         tmp_out,

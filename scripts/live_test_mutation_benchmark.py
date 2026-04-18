@@ -16,7 +16,14 @@ import torch
 from Bio.PDB import Selection
 
 from dlpacker_pytorch import DLPacker
-from dlpacker_pytorch.utils import DLPModel, THE20
+from dlpacker_pytorch.dlpacker import DEFAULT_WEIGHTS
+from dlpacker_pytorch.utils import (
+    DLPModel,
+    THE20,
+    checkpoint_info,
+    ensure_pretrained_weights,
+    file_sha256,
+)
 
 
 # 10-mutation live-test plan for 1UBQ (resid -> new amino acid)
@@ -250,6 +257,15 @@ def run_one(
     t0 = time.time()
     model = DLPModel(device=device)
     dlp = DLPacker(str(pdb_path), model=model)
+    pt_path = ensure_pretrained_weights(DEFAULT_WEIGHTS)
+    h5_path = f'{DEFAULT_WEIGHTS}.h5'
+    meta = checkpoint_info(pt_path).get('meta', {})
+    print(
+        f'[{device}][{scenario_label}] weights: '
+        f'h5_sha={file_sha256(h5_path)[:12]} pt_sha={file_sha256(pt_path)[:12]} '
+        f'converter={meta.get("converter_version", "n/a")}',
+        flush=True,
+    )
 
     print(f'[{device}][{scenario}] setup & mutations...', flush=True)
     with contextlib.redirect_stdout(io.StringIO()):

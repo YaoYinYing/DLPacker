@@ -7,7 +7,13 @@ import pytest
 import torch
 
 import dlpacker_pytorch.dlpacker as dlp_mod
-from dlpacker_pytorch.utils import WEIGHT_URL, WeightBootstrapError, ensure_pretrained_weights
+from dlpacker_pytorch.utils import (
+    CONVERTER_VERSION,
+    GRID_SIZE,
+    WEIGHT_URL,
+    WeightBootstrapError,
+    ensure_pretrained_weights,
+)
 
 
 def _write_min_h5(path: Path) -> None:
@@ -19,10 +25,35 @@ def _write_valid_pt(path: Path) -> None:
     torch.save({'state_dict': {'x': torch.ones(1)}}, path)
 
 
+def _write_semantic_pt(path: Path, h5_path: Path) -> None:
+    import hashlib
+
+    h = hashlib.sha256(h5_path.read_bytes()).hexdigest()
+    torch.save(
+        {
+            'state_dict': {'x': torch.ones(1)},
+            'meta': {
+                'source_h5': str(h5_path),
+                'source_h5_sha256': h,
+                'converter_version': CONVERTER_VERSION,
+                'arch': {
+                    'width': 128,
+                    'nres': 6,
+                    'grid_size': GRID_SIZE,
+                    'num_channels': 27,
+                },
+            },
+        },
+        path,
+    )
+
+
 def test_bootstrap_uses_existing_valid_pt_without_fetch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     prefix = tmp_path / 'DLPacker_weights'
+    h5_path = prefix.with_suffix('.h5')
     pt_path = prefix.with_suffix('.pt')
-    _write_valid_pt(pt_path)
+    _write_min_h5(h5_path)
+    _write_semantic_pt(pt_path, h5_path)
 
     def _never_fetch(_):
         raise AssertionError('fetch should not be called')
@@ -40,7 +71,7 @@ def test_bootstrap_converts_from_h5_when_pt_missing(tmp_path: Path, monkeypatch:
 
     def _fake_convert(keras_h5_path: str, out_pt_path: str, **_):
         assert keras_h5_path == str(h5_path)
-        _write_valid_pt(Path(out_pt_path))
+        _write_semantic_pt(Path(out_pt_path), h5_path)
         return out_pt_path
 
     monkeypatch.setattr('dlpacker_pytorch.utils.convert_keras_h5_to_pt', _fake_convert)
@@ -62,7 +93,7 @@ def test_bootstrap_regenerates_when_pt_corrupt(tmp_path: Path, monkeypatch: pyte
 
     def _fake_convert(**kwargs):
         called['count'] += 1
-        _write_valid_pt(Path(kwargs['out_pt_path']))
+        _write_semantic_pt(Path(kwargs['out_pt_path']), h5_path)
         return kwargs['out_pt_path']
 
     monkeypatch.setattr('dlpacker_pytorch.utils.convert_keras_h5_to_pt', _fake_convert)
@@ -81,7 +112,7 @@ def test_bootstrap_fetches_when_missing(tmp_path: Path, monkeypatch: pytest.Monk
         return [h5_path.name]
 
     def _fake_convert(**kwargs):
-        _write_valid_pt(Path(kwargs['out_pt_path']))
+        _write_semantic_pt(Path(kwargs['out_pt_path']), h5_path)
         return kwargs['out_pt_path']
 
     monkeypatch.setattr('dlpacker_pytorch.utils._fetch_and_extract_once', _fake_fetch)
@@ -105,7 +136,7 @@ def test_bootstrap_retries_after_transient_fetch_error(tmp_path: Path, monkeypat
         return [h5_name]
 
     def _fake_convert(**kwargs):
-        _write_valid_pt(Path(kwargs['out_pt_path']))
+        _write_semantic_pt(Path(kwargs['out_pt_path']), prefix.with_suffix('.h5'))
         return kwargs['out_pt_path']
 
     monkeypatch.setattr('dlpacker_pytorch.utils._fetch_and_extract_once', _flaky_fetch)
@@ -140,6 +171,26 @@ def test_bootstrap_persistent_fetch_error_has_actionable_message(
     assert 'convert_keras_weights.py' in msg
     assert str(prefix.with_suffix('.h5')) in msg
     assert str(prefix.with_suffix('.pt')) in msg
+
+
+def test_bootstrap_rebuilds_when_pt_fingerprint_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    prefix = tmp_path / 'DLPacker_weights'
+    h5_path = prefix.with_suffix('.h5')
+    pt_path = prefix.with_suffix('.pt')
+    _write_min_h5(h5_path)
+    _write_valid_pt(pt_path)  # no fingerprint metadata
+
+    called = {'count': 0}
+
+    def _fake_convert(**kwargs):
+        called['count'] += 1
+        _write_semantic_pt(Path(kwargs['out_pt_path']), h5_path)
+        return kwargs['out_pt_path']
+
+    monkeypatch.setattr('dlpacker_pytorch.utils.convert_keras_h5_to_pt', _fake_convert)
+    out = ensure_pretrained_weights(str(prefix), fetch_if_missing=False)
+    assert out == str(pt_path)
+    assert called['count'] == 1
 
 
 def test_failed_conversion_does_not_leave_partial_pt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
