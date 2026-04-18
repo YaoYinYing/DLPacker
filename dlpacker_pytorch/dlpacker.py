@@ -471,6 +471,79 @@ class DLPacker:
         for d in l:
             residue.detach_child(d)
 
+    def _local_environment_coords(
+        self,
+        residue: Residue,
+        cutoff: float = 8.0,
+    ) -> np.ndarray:
+        # Collect nearby heavy-atom coordinates from all other residues.
+        if residue.has_id('CA'):
+            center = residue['CA'].coord
+        else:
+            center = np.mean([a.coord for a in residue], axis=0)
+
+        out = []
+        parent = self._get_parent_structure(residue)
+        for atom in parent.get_atoms():
+            if atom.element == 'H':
+                continue
+            if atom.get_parent() == residue:
+                continue
+            if np.linalg.norm(atom.coord - center) <= cutoff:
+                out.append(atom.coord)
+        if not out:
+            return np.zeros((0, 3), dtype=np.float32)
+        return np.array(out, dtype=np.float32)
+
+    def _select_rotamer_with_steric_filter(
+        self,
+        residue: Residue,
+        label: str,
+        raw_scores: np.ndarray,
+        top_k: int = 20,
+        search_k: int = 200,
+        min_nonbonded: float = 1.0,
+    ) -> int:
+        # Keep TF-like ranking as the primary signal, but avoid severe clashes
+        # by checking local heavy-atom distances for top-ranked candidates.
+        order = np.argsort(raw_scores)
+        if order.size == 0:
+            raise ValueError('No rotamer candidates available.')
+
+        env = self._local_environment_coords(residue, cutoff=8.0)
+        if env.shape[0] == 0:
+            return int(order[0])
+
+        candidates = self.library['coords'][label]
+        k = max(1, min(top_k, int(order.size)))
+        search = max(k, min(search_k, int(order.size)))
+        fallback_idx = int(order[0])
+        fallback_margin = -1.0
+
+        for idx in order[:k]:
+            coords = candidates[int(idx)].astype(np.float32)
+            d = np.linalg.norm(coords[:, None, :] - env[None, :, :], axis=-1)
+            min_d = float(np.min(d))
+            if min_d >= min_nonbonded:
+                return int(idx)
+            if min_d > fallback_margin:
+                fallback_margin = min_d
+                fallback_idx = int(idx)
+
+        # If top-k all clash, widen search while preserving score ordering.
+        for idx in order[k:search]:
+            coords = candidates[int(idx)].astype(np.float32)
+            d = np.linalg.norm(coords[:, None, :] - env[None, :, :], axis=-1)
+            min_d = float(np.min(d))
+            if min_d >= min_nonbonded:
+                return int(idx)
+            if min_d > fallback_margin:
+                fallback_margin = min_d
+                fallback_idx = int(idx)
+
+        # If all top-k candidates clash, choose the least-clashing one.
+        return fallback_idx
+
     def _get_prediction(self, box: dict, label: str):
         # Runs NN prediction to get density
 
@@ -551,7 +624,11 @@ class DLPacker:
         # this block runs reconstruction of the residue
         scores = np.abs(self.library['grids'][n] - pred)
         scores = np.mean(scores, axis=tuple(range(1, pred.ndim + 1)))
-        best_ind = np.argmin(scores)
+        best_ind = self._select_rotamer_with_steric_filter(
+            residue=residue,
+            label=n,
+            raw_scores=scores,
+        )
         best_score = np.min(scores)
         best_match = self.library['coords'][n][best_ind]
 
